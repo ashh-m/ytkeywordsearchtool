@@ -552,8 +552,20 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 title = None
         if not view_count:
             try:
+                # First try #metadata-line which is more reliable
                 v = page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('span,div')].find(n => n.getAttribute && n.getAttribute('aria-label') && /view[s]?/i.test(n.getAttribute('aria-label')));
+                    const metaLine = document.querySelector('#metadata-line');
+                    if (metaLine) {
+                        const text = metaLine.innerText || metaLine.textContent || '';
+                        const match = text.match(/([\\d,\\.]+[KMB]?)\\s*views?/i);
+                        if (match) return match[0];
+                    }
+                    // Fallback: look for aria-label with digits AND the word "view"
+                    const el = [...document.querySelectorAll('span,div')].find(n => {
+                        const label = n.getAttribute && n.getAttribute('aria-label');
+                        // Must contain digits and the word "view" to avoid "Shopping" or other buttons
+                        return label && /\\d/.test(label) && /views?/i.test(label);
+                    });
                     return el ? el.getAttribute('aria-label') : null;
                 }""")
                 view_count = parse_count_text_to_int(v)
@@ -669,6 +681,49 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
             channel_id_nav = find_nested_key(owner_info, "navigationEndpoint")
             if channel_id_nav:
                 channel_id = channel_id or channel_id_nav.get("browseEndpoint", {}).get("browseId")
+
+        # DOM fallback for missing fields when ytInitialPlayerResponse is missing
+        # Extract uploadDate from #info-strings if not available
+        if not upload_date_iso:
+            try:
+                date_text = page.evaluate("""() => {
+                    // Try #info-strings first (common location for upload date)
+                    const infoStrings = document.querySelector('#info-strings yt-formatted-string');
+                    if (infoStrings) return infoStrings.innerText || infoStrings.textContent;
+                    // Fallback: look for date patterns in info container
+                    const info = document.querySelector('#info-container #info, #info');
+                    if (info) {
+                        const text = info.innerText || info.textContent || '';
+                        const dateMatch = text.match(/(\\w+\\s+\\d{1,2},\\s+\\d{4}|\\d{1,2}\\s+\\w+\\s+\\d{4})/);
+                        if (dateMatch) return dateMatch[0];
+                    }
+                    return null;
+                }""")
+                upload_date_iso = date_text or upload_date_iso
+            except Exception:
+                pass
+
+        # Extract channel_id from channel link href if still missing
+        if not channel_id:
+            try:
+                channel_id_from_href = page.evaluate("""() => {
+                    // Look for channel link with /channel/CHANNELID pattern
+                    const channelLink = document.querySelector('a[href*="/channel/"]');
+                    if (channelLink) {
+                        const match = channelLink.href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (match) return match[1];
+                    }
+                    // Also check owner links
+                    const ownerLink = document.querySelector('#owner a[href*="/channel/"], ytd-video-owner-renderer a[href*="/channel/"]');
+                    if (ownerLink) {
+                        const match = ownerLink.href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (match) return match[1];
+                    }
+                    return null;
+                }""")
+                channel_id = channel_id_from_href or channel_id
+            except Exception:
+                pass
 
         hashtags = extract_hashtags_from_text(description)
 
@@ -1031,13 +1086,21 @@ def gather_shorts_hrefs(page: Page) -> List[str]:
 
 
 def gather_regular_hrefs(page: Page) -> List[str]:
-    """Collect watch?v= links from various renderers and canonicalize them."""
+    """Collect watch?v= links from ytd-video-renderer elements, excluding shelf renderers (People also watched, Related)."""
     hrefs = []
     try:
         anchors = page.evaluate("""
             () => {
                 const out = new Set();
-                document.querySelectorAll('a#video-title, a#video-title-link, a[href*="/watch?v="]').forEach(a => { try { if (a.href) out.add(a.href); } catch(e){} });
+                // Target ytd-video-renderer specifically to avoid "People also watched" and "Related" shelves
+                document.querySelectorAll('ytd-video-renderer a#video-title, ytd-video-renderer a#video-title-link').forEach(a => {
+                    try {
+                        // Exclude if inside ytd-shelf-renderer (People also watched, Related, etc.)
+                        if (!a.closest('ytd-shelf-renderer') && a.href) {
+                            out.add(a.href);
+                        }
+                    } catch(e){}
+                });
                 return Array.from(out);
             }
         """) or []
