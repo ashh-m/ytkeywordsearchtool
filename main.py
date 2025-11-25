@@ -553,22 +553,25 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if not view_count:
             try:
                 v = page.evaluate("""() => {
+                    // Stricter pattern: requires digits and the word "view"
+                    const viewCountPattern = /[\\d,.]+[KMB]?\\s+view/i;
+                    
                     // First try #metadata-line or .ytd-shorts-player-controls-renderer containing "view"
                     const metadataLine = document.querySelector('#metadata-line, .ytd-shorts-player-controls-renderer');
                     if (metadataLine) {
                         const ariaLabel = metadataLine.getAttribute('aria-label');
-                        if (ariaLabel && /[\\d,.]+[KMB]?\\s+view/i.test(ariaLabel)) {
+                        if (ariaLabel && viewCountPattern.test(ariaLabel)) {
                             return ariaLabel;
                         }
                         const text = metadataLine.innerText || metadataLine.textContent;
-                        if (text && /[\\d,.]+[KMB]?\\s+view/i.test(text)) {
+                        if (text && viewCountPattern.test(text)) {
                             return text;
                         }
                     }
                     // Fallback: find elements with aria-label that matches stricter pattern with digits and "view"
                     const el = [...document.querySelectorAll('span,div')].find(n => {
                         const ariaLabel = n.getAttribute && n.getAttribute('aria-label');
-                        return ariaLabel && /[\\d,.]+[KMB]?\\s+view/i.test(ariaLabel);
+                        return ariaLabel && viewCountPattern.test(ariaLabel);
                     });
                     return el ? el.getAttribute('aria-label') : null;
                 }""")
@@ -704,8 +707,8 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
                     const channelLink = document.querySelector('ytd-channel-name a[href]');
                     if (channelLink) {
                         const href = channelLink.getAttribute('href') || '';
-                        // Extract channel ID from /channel/UC... format
-                        const channelMatch = href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        // Extract channel ID from /channel/UC... format (UC followed by 22 characters)
+                        const channelMatch = href.match(/\\/channel\\/(UC[A-Za-z0-9_-]{22})/);
                         if (channelMatch) return channelMatch[1];
                         // Extract from /@handle format - we'd need to navigate or return null
                     }
