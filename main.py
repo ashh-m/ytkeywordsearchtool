@@ -553,7 +553,23 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if not view_count:
             try:
                 v = page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('span,div')].find(n => n.getAttribute && n.getAttribute('aria-label') && /view[s]?/i.test(n.getAttribute('aria-label')));
+                    // First try #metadata-line or .ytd-shorts-player-controls-renderer containing "view"
+                    const metadataLine = document.querySelector('#metadata-line, .ytd-shorts-player-controls-renderer');
+                    if (metadataLine) {
+                        const ariaLabel = metadataLine.getAttribute('aria-label');
+                        if (ariaLabel && /[\\d,.]+[KMB]?\\s+view/i.test(ariaLabel)) {
+                            return ariaLabel;
+                        }
+                        const text = metadataLine.innerText || metadataLine.textContent;
+                        if (text && /[\\d,.]+[KMB]?\\s+view/i.test(text)) {
+                            return text;
+                        }
+                    }
+                    // Fallback: find elements with aria-label that matches stricter pattern with digits and "view"
+                    const el = [...document.querySelectorAll('span,div')].find(n => {
+                        const ariaLabel = n.getAttribute && n.getAttribute('aria-label');
+                        return ariaLabel && /[\\d,.]+[KMB]?\\s+view/i.test(ariaLabel);
+                    });
                     return el ? el.getAttribute('aria-label') : null;
                 }""")
                 view_count = parse_count_text_to_int(v)
@@ -669,6 +685,34 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
             channel_id_nav = find_nested_key(owner_info, "navigationEndpoint")
             if channel_id_nav:
                 channel_id = channel_id or channel_id_nav.get("browseEndpoint", {}).get("browseId")
+
+        # DOM fallbacks when ytInitialPlayerResponse is missing or incomplete
+        # Fallback for Upload Date: use #info-strings yt-formatted-string
+        if not upload_date_iso:
+            try:
+                upload_date_iso = page.evaluate("""() => {
+                    const el = document.querySelector('#info-strings yt-formatted-string');
+                    return el ? el.innerText.trim() : null;
+                }""")
+            except Exception:
+                pass
+
+        # Fallback for Channel ID: extract from ytd-channel-name a href if missing
+        if not channel_id:
+            try:
+                channel_id = page.evaluate("""() => {
+                    const channelLink = document.querySelector('ytd-channel-name a[href]');
+                    if (channelLink) {
+                        const href = channelLink.getAttribute('href') || '';
+                        // Extract channel ID from /channel/UC... format
+                        const channelMatch = href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (channelMatch) return channelMatch[1];
+                        // Extract from /@handle format - we'd need to navigate or return null
+                    }
+                    return null;
+                }""")
+            except Exception:
+                pass
 
         hashtags = extract_hashtags_from_text(description)
 
@@ -1031,13 +1075,29 @@ def gather_shorts_hrefs(page: Page) -> List[str]:
 
 
 def gather_regular_hrefs(page: Page) -> List[str]:
-    """Collect watch?v= links from various renderers and canonicalize them."""
+    """Collect watch?v= links from various renderers and canonicalize them.
+    Specifically targets ytd-video-renderer #video-title and excludes links inside ytd-shelf-renderer.
+    """
     hrefs = []
     try:
         anchors = page.evaluate("""
             () => {
                 const out = new Set();
-                document.querySelectorAll('a#video-title, a#video-title-link, a[href*="/watch?v="]').forEach(a => { try { if (a.href) out.add(a.href); } catch(e){} });
+                // Target ytd-video-renderer #video-title specifically, excluding ytd-shelf-renderer
+                document.querySelectorAll('ytd-video-renderer #video-title').forEach(a => {
+                    try {
+                        // Skip if inside a shelf renderer (e.g., "People also watched")
+                        if (a.closest('ytd-shelf-renderer')) return;
+                        if (a.href) out.add(a.href);
+                    } catch(e){}
+                });
+                // Also check a#video-title-link with same exclusion
+                document.querySelectorAll('a#video-title-link').forEach(a => {
+                    try {
+                        if (a.closest('ytd-shelf-renderer')) return;
+                        if (a.href) out.add(a.href);
+                    } catch(e){}
+                });
                 return Array.from(out);
             }
         """) or []
