@@ -1,0 +1,17 @@
+{
+  "actorSpecification": 1,
+  "name": "youtube-scraper-actor",
+  "title": "YouTube Scraper",
+  "description": "Extract videos, channels, playlists, and search results (with metadata, subtitles, comments, analysis, and robust error handling) from YouTube URLs or search terms.",
+  "version": "0.1",
+  "meta": {
+    "templateId": "youtube-scraper"
+  },
+  "input": "./input_schema.json",
+  "dockerfile": "./Dockerfile",
+  "readme": "./README.md",
+  "storages": {
+    "dataset": "./dataset_schema.json"
+  },
+  "minMemoryMbytes": 2048
+}

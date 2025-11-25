@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "type": { "type": "string", "description": "Item type, e.g., channel_detail" },
+    "channel_url": { "type": "string", "format": "uri", "description": "Original channel URL" },
+    "channel_id": { "type": ["string", "null"], "description": "YouTube channel ID (UC...)" },
+    "channel_name": { "type": ["string", "null"], "description": "Channel display name" },
+    "logo_url": { "type": ["string", "null"], "format": "uri", "description": "Channel avatar/logo URL" },
+    "subscribers": { "type": ["string", "null"], "description": "Raw subscriber count text as shown on YouTube" },
+    "subscribers_count": { "type": ["integer", "null"], "description": "Parsed numeric subscriber count (integer)" },
+    "description": { "type": ["string", "null"], "description": "Full About page description" },
+    "note": { "type": ["string", "null"], "description": "Informational note (e.g., subscriber usernames not available)" }
+  },
+  "additionalProperties": true
+}
