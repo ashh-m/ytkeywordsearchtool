@@ -625,18 +625,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_id = channel_id or ch.get("browseEndpoint", {}).get("browseId")
             channel_name = channel_name or _text_from(find_nested_key(overlay, "channelTitleText"))
         
-        # Try structured data (ld+json) for title - iterate ALL script tags to find video data
-        if not title:
-            try:
-                title = page.evaluate("""() => {
-                    // Try structured data - iterate ALL ld+json scripts to find video data
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
-                        try {
-                            const data = JSON.parse(ldJson.textContent);
-                            // Check for name field (VideoObject will have this)
-                            if (data.name) return data.name;
-        # Fix 1: Improved structured data extraction - handle both single object and array formats
+        # Improved structured data extraction - handle both single object and array formats
         if not title or not upload_date_iso or not channel_name:
             try:
                 ld_data = page.evaluate("""() => {
@@ -1618,106 +1607,12 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
     logging.info("  Channel scrape types=%s, videos_cap=%d, shorts_cap=%d, overall_cap=%d", types, videos_cap, shorts_cap, overall_cap)
     
     links_seen: Set[str] = set()
-    video_urls: List[str] = []  # regular videos (watch?v=)
-    shorts_urls: List[str] = []  # shorts (/shorts/)
-    
-    def collect_urls_from_page(target_cap: int, url_type: str) -> List[str]:
-        """Scroll and collect URLs from current page, filtering by type."""
-        collected: List[str] = []
-        rounds = 0
-        max_rounds = 60
-        
-        while len(collected) < target_cap and rounds < max_rounds and not STOP_FLAG:
-            try:
-                hrefs = page.evaluate("""
-                    () => {
-                        const out = new Set();
-                        const sel = [
-                            'a#video-title',
-                            'a#video-title-link',
-                            'a[href*="/watch?v="]',
-                            'a[href*="/shorts/"]',
-                            'ytd-reel-item-renderer a[href*="/shorts/"]',
-                            'ytd-reel-shelf-renderer a[href*="/shorts/"]'
-                        ];
-                        sel.forEach(s => {
-                            document.querySelectorAll(s).forEach(a => {
-                                try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                            });
-                        });
-                        // fallback: look for any href attributes that include /shorts/ or watch?v=
-                        document.querySelectorAll('[href*="/shorts/"], a[href*="/watch?v="]').forEach(a => {
-                            try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                        });
-                        return Array.from(out);
-                    }
-                """) or []
-            except Exception:
-                hrefs = []
-
-            for h in hrefs:
-                if STOP_FLAG or len(collected) >= target_cap:
-                    break
-                try:
-                    full = h if h.startswith("http") else f"https://www.youtube.com{h}"
-                    full = clean_video_url(full)
-                    vid = extract_video_id(full)
-                    if not vid:
-                        continue
-                    if full in links_seen:
-                        continue
-                    
-                    # Filter by URL type
-                    is_short = "/shorts/" in full
-                    if url_type == "shorts" and not is_short:
-                        continue
-                    if url_type == "video" and is_short:
-                        continue
-                    
-                    links_seen.add(full)
-                    collected.append(full)
-                except Exception:
-                    continue
-
-            if len(collected) >= target_cap:
-                break
-            page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(350)
-            rounds += 1
-        
-        return collected
+    all_video_urls: List[str] = []
     
     def try_navigate_to_tab(url: str) -> bool:
         """Try to navigate to a channel tab and return success."""
-    Fix 2: Restructured to navigate to BOTH /videos and /shorts tabs when both types are requested,
-    then combine results up to the caps.
-    """
-    global STOP_FLAG
-
-    base = channel_url.split('?')[0].rstrip("/")
-    videos_url = base + "/videos"
-    shorts_url = base + "/shorts"
-    
-    types = normalize_search_video_types(input_options)
-    logging.info("  Channel scraping for types: %s", types)
-    
-    # Get per-type caps
-    default_cap = int(input_options.get("maxResults", 10))
-    video_cap = get_cap_for_type("video", input_options, default_cap) if "video" in types else 0
-    shorts_cap = get_cap_for_type("shorts", input_options, default_cap) if "shorts" in types else 0
-    
-    all_video_urls: List[str] = []
-    links_seen: Set[str] = set()
-    
-    def collect_urls_from_page(target_url: str, url_pattern: str, cap: int) -> List[str]:
-        """Helper to collect URLs from a channel tab page."""
-        nonlocal links_seen
-        if cap <= 0:
-            return []
-        
-        collected: List[str] = []
         try:
-            goto_and_ready(page, target_url)
+            goto_and_ready(page, url)
             if is_page_unavailable(page):
                 logging.info("  Candidate %s reports unavailable", url)
                 return False
@@ -1734,17 +1629,16 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
             logging.warning("  Failed to open %s: %s", url, e)
             return False
 
-    # When both types are requested, collect from BOTH tabs separately
-    if want_videos and videos_cap > 0:
-        logging.info("  Collecting regular videos from /videos tab (cap=%d)...", videos_cap)
-        if try_navigate_to_tab(videos_candidate):
-            video_urls = collect_urls_from_page(videos_cap, "video")
-            logging.info("  Collected %d regular video URLs from /videos tab", len(video_urls))
-        else:
-            # Fallback: try original channel URL for videos
-            if try_navigate_to_tab(channel_url):
-                video_urls = collect_urls_from_page(videos_cap, "video")
-                logging.info("  Collected %d regular video URLs from channel home", len(video_urls))
+    def collect_urls_from_page(target_url: str, url_pattern: str, cap: int) -> List[str]:
+        """Navigate to target_url and collect URLs matching url_pattern up to cap."""
+        nonlocal links_seen
+        if cap <= 0:
+            return []
+        
+        collected: List[str] = []
+        try:
+            goto_and_ready(page, target_url)
+            if is_page_unavailable(page):
                 logging.info("  Tab %s reports unavailable", target_url)
                 return []
             
@@ -1813,18 +1707,18 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
         except Exception as e:
             logging.warning("  Failed to collect from %s: %s", target_url, e)
             return collected
-    
-    # Fix 2: Collect regular videos if requested
-    if "video" in types and video_cap > 0 and not STOP_FLAG:
-        logging.info("  Collecting up to %d regular videos from %s", video_cap, videos_url)
-        video_urls = collect_urls_from_page(videos_url, "/watch", video_cap)
+
+    # Collect regular videos if requested
+    if "video" in types and videos_cap > 0 and not STOP_FLAG:
+        logging.info("  Collecting up to %d regular videos from %s", videos_cap, videos_candidate)
+        video_urls = collect_urls_from_page(videos_candidate, "/watch", videos_cap)
         all_video_urls.extend(video_urls)
         logging.info("  Collected %d regular video URLs", len(video_urls))
     
-    # Fix 2: Collect shorts if requested
+    # Collect shorts if requested
     if "shorts" in types and shorts_cap > 0 and not STOP_FLAG:
-        logging.info("  Collecting up to %d shorts from %s", shorts_cap, shorts_url)
-        shorts_urls = collect_urls_from_page(shorts_url, "/shorts/", shorts_cap)
+        logging.info("  Collecting up to %d shorts from %s", shorts_cap, shorts_candidate)
+        shorts_urls = collect_urls_from_page(shorts_candidate, "/shorts/", shorts_cap)
         all_video_urls.extend(shorts_urls)
         logging.info("  Collected %d shorts URLs", len(shorts_urls))
     
