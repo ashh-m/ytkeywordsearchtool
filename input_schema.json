@@ -28,21 +28,21 @@
     "maxVideosPerTerm": {
       "title": "Maximum videos per search term (optional)",
       "type": "integer",
-      "description": "Maximum number of regular video results to collect per search term.",
+      "description": "Maximum number of regular video results to collect per search term. Set to 0 to skip video collection.",
       "minimum": 0,
       "default": 10
     },
     "maxShortsPerTerm": {
       "title": "Maximum shorts per search term (optional)",
       "type": "integer",
-      "description": "Maximum number of Shorts results to collect per search term.",
+      "description": "Maximum number of Shorts results to collect per search term. Set to 0 to skip shorts (default: 0 = no shorts).",
       "minimum": 0,
       "default": 0
     },
     "maxStreamsPerTerm": {
       "title": "Maximum streams per search term (optional)",
       "type": "integer",
-      "description": "Maximum number of live stream results to collect per search term.",
+      "description": "Maximum number of live stream results to collect per search term. Set to 0 to skip streams.",
       "minimum": 0,
       "default": 0
     },

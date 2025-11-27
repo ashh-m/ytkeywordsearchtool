@@ -533,54 +533,239 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
     logging.info("Extracting metadata for SHORT: %s", video_id)
     try:
         initial = try_get_initial_data(page)
+        player_json = try_get_player_json(page)
         overlay = None
         if initial:
             overlay = find_nested_key(initial, "reelPlayerOverlayRenderer") or find_nested_key(initial, "shortsPlayerOverlayRenderer")
         title = None; view_count = None; like_count = None; channel_name = None; channel_id = None; description = None
+        channel_username = None; subscriber_count = None
+        
+        # Try to get data from player_json.videoDetails first (most reliable)
+        if player_json and isinstance(player_json, dict):
+            vd = player_json.get("videoDetails", {}) or {}
+            if vd:
+                title = title or vd.get("title")
+                description = description or vd.get("shortDescription") or vd.get("description")
+                view_count = view_count or (int(vd.get("viewCount")) if vd.get("viewCount") and str(vd.get("viewCount")).isdigit() else parse_count_text_to_int(vd.get("viewCount")))
+                channel_name = channel_name or vd.get("author")
+                channel_id = channel_id or vd.get("channelId")
+        
         if overlay:
-            title = _text_from(overlay.get("reelTitleText") or overlay.get("shortsTitleText"))
-            view_count = parse_count_text_to_int(_text_from(find_nested_key(overlay, "viewCountText")))
-            like_count = parse_count_text_to_int(_text_from(find_nested_key(overlay, "likeButton")))
+            title = title or _text_from(overlay.get("reelTitleText") or overlay.get("shortsTitleText"))
+            view_count = view_count or parse_count_text_to_int(_text_from(find_nested_key(overlay, "viewCountText")))
+            like_count = like_count or parse_count_text_to_int(_text_from(find_nested_key(overlay, "likeButton")))
             ch = find_nested_key(overlay, "navigationEndpoint") or find_nested_key(overlay, "videoOwner")
             if ch and isinstance(ch, dict):
-                channel_id = ch.get("browseEndpoint", {}).get("browseId")
-            channel_name = _text_from(find_nested_key(overlay, "channelTitleText"))
+                channel_id = channel_id or ch.get("browseEndpoint", {}).get("browseId")
+            channel_name = channel_name or _text_from(find_nested_key(overlay, "channelTitleText"))
+        
+        # Try structured data (ld+json) for title - more reliable than document.title
         if not title:
             try:
-                title = page.evaluate("() => document.querySelector('meta[name=\"title\"]')?.getAttribute('content') || document.title || null")
+                title = page.evaluate("""() => {
+                    // Try structured data first
+                    const ldJson = document.querySelector('script[type="application/ld+json"]');
+                    if (ldJson) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.name) return data.name;
+                        } catch(e) {}
+                    }
+                    // Try og:title meta tag
+                    const ogTitle = document.querySelector('meta[property="og:title"]');
+                    if (ogTitle) {
+                        const content = ogTitle.getAttribute('content');
+                        if (content && content !== 'YouTube') return content;
+                    }
+                    // Try meta name title
+                    const metaTitle = document.querySelector('meta[name="title"]');
+                    if (metaTitle) {
+                        const content = metaTitle.getAttribute('content');
+                        if (content && content !== 'YouTube') return content;
+                    }
+                    // Last resort: page title but filter out just "YouTube"
+                    const pageTitle = document.title;
+                    if (pageTitle && pageTitle !== 'YouTube' && !pageTitle.match(/^YouTube\\s*$/)) {
+                        return pageTitle.replace(/ - YouTube$/, '');
+                    }
+                    return null;
+                }""")
             except Exception:
                 title = None
+        
         if not view_count:
             try:
+                # First try #metadata-line which is more reliable
                 v = page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('span,div')].find(n => n.getAttribute && n.getAttribute('aria-label') && /view[s]?/i.test(n.getAttribute('aria-label')));
+                    const metaLine = document.querySelector('#metadata-line');
+                    if (metaLine) {
+                        const text = metaLine.innerText || metaLine.textContent || '';
+                        const match = text.match(/([\\d,\\.]+[KMB]?)\\s*views?/i);
+                        if (match) return match[0];
+                    }
+                    // Fallback: look for aria-label with digits AND the word "view"
+                    const el = [...document.querySelectorAll('span,div')].find(n => {
+                        const label = n.getAttribute && n.getAttribute('aria-label');
+                        // Must contain digits and the word "view" to avoid "Shopping" or other buttons
+                        return label && /\\d/.test(label) && /views?/i.test(label);
+                    });
                     return el ? el.getAttribute('aria-label') : null;
                 }""")
                 view_count = parse_count_text_to_int(v)
             except Exception:
                 view_count = None
-        if not channel_name:
+        
+        # Extract like_count from DOM if still missing (Shorts use a different UI)
+        if not like_count:
             try:
-                ch = page.evaluate("""() => {
-                    const a = document.querySelector('a[href^="/channel"], a[href^="/@"]');
-                    return a ? a.innerText.trim() : null;
+                like_text = page.evaluate("""() => {
+                    // Shorts like button - look for aria-label containing "like" and a number
+                    const buttons = document.querySelectorAll('button[aria-label]');
+                    for (const btn of buttons) {
+                        const label = btn.getAttribute('aria-label') || '';
+                        // Must contain "like" (case insensitive) and have digits, but not "dislike"
+                        if (/like/i.test(label) && !/dislike/i.test(label) && /\\d/.test(label)) {
+                            const match = label.match(/([\\d,\\.]+[KMB]?)/i);
+                            if (match) return match[1];
+                        }
+                    }
+                    // Try text inside like button
+                    const likeCount = document.querySelector('#like-button span, ytd-toggle-button-renderer span');
+                    if (likeCount) {
+                        const text = likeCount.innerText || likeCount.textContent || '';
+                        if (/\\d/.test(text)) return text;
+                    }
+                    return null;
                 }""")
-                channel_name = ch or channel_name
+                like_count = parse_count_text_to_int(like_text)
             except Exception:
                 pass
+        
+        # Extract channel info - be very specific to avoid "Shopping" or other buttons
+        if not channel_name or channel_name.lower() == 'shopping':
+            try:
+                channel_info = page.evaluate("""() => {
+                    // Look specifically in the shorts player overlay for channel info
+                    // The channel link should be in the video owner section, not in the sidebar
+                    const ownerLinks = document.querySelectorAll('ytd-channel-name a, .ytd-reel-player-overlay-renderer a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/channel/"]');
+                    for (const link of ownerLinks) {
+                        const text = (link.innerText || link.textContent || '').trim();
+                        // Skip if it's "Shopping" or empty
+                        if (text && text.toLowerCase() !== 'shopping' && text.toLowerCase() !== 'youtube') {
+                            return {name: text, href: link.href};
+                        }
+                    }
+                    // Try structured data
+                    const ldJson = document.querySelector('script[type="application/ld+json"]');
+                    if (ldJson) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.author && data.author.name) {
+                                return {name: data.author.name, href: data.author.url || null};
+                            }
+                        } catch(e) {}
+                    }
+                    // Try og:site_name or author meta
+                    const authorMeta = document.querySelector('meta[name="author"]');
+                    if (authorMeta) {
+                        const content = authorMeta.getAttribute('content');
+                        if (content && content.toLowerCase() !== 'shopping' && content.toLowerCase() !== 'youtube') {
+                            return {name: content, href: null};
+                        }
+                    }
+                    return null;
+                }""")
+                if channel_info and isinstance(channel_info, dict):
+                    if channel_info.get('name') and channel_info['name'].lower() not in ['shopping', 'youtube']:
+                        channel_name = channel_info['name']
+                    if channel_info.get('href'):
+                        # Extract channel_id and username from href
+                        href = channel_info['href']
+                        if '/channel/' in href:
+                            match = re.search(r'/channel/([A-Za-z0-9_-]+)', href)
+                            if match:
+                                channel_id = channel_id or match.group(1)
+                        if '/@' in href:
+                            match = re.search(r'/@([A-Za-z0-9_.-]+)', href)
+                            if match:
+                                channel_username = channel_username or match.group(1)
+            except Exception:
+                pass
+        
+        # Extract channel_username (handle like @username)
+        if not channel_username:
+            try:
+                channel_username = page.evaluate("""() => {
+                    // Look for channel link with /@username pattern - be specific
+                    const handleLinks = document.querySelectorAll('ytd-channel-name a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/@"]');
+                    for (const link of handleLinks) {
+                        const match = link.href.match(/@([A-Za-z0-9_.-]+)/);
+                        if (match) return match[1];
+                    }
+                    // Try structured data
+                    const ldJson = document.querySelector('script[type="application/ld+json"]');
+                    if (ldJson) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.author && data.author.url) {
+                                const match = data.author.url.match(/@([A-Za-z0-9_.-]+)/);
+                                if (match) return match[1];
+                            }
+                        } catch(e) {}
+                    }
+                    return null;
+                }""")
+            except Exception:
+                pass
+        
+        # Extract subscriber_count from DOM
         try:
-            d = page.evaluate("""() => {
-                const meta = document.querySelector('meta[name="description"]');
-                return meta ? meta.getAttribute('content') : null;
+            sub_text = page.evaluate("""() => {
+                // Try subscriber count in shorts overlay
+                const subCount = document.querySelector('ytd-reel-video-renderer #subscriber-count, #owner-sub-count, .ytd-reel-player-overlay-renderer #subscriber-count');
+                if (subCount) return subCount.innerText || subCount.textContent;
+                return null;
             }""")
-            description = d or description
+            subscriber_count = parse_count_text_to_int(sub_text)
         except Exception:
             pass
+        
+        # Get description from structured data or meta
+        if not description:
+            try:
+                description = page.evaluate("""() => {
+                    // Try structured data first
+                    const ldJson = document.querySelector('script[type="application/ld+json"]');
+                    if (ldJson) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.description) return data.description;
+                        } catch(e) {}
+                    }
+                    // Try og:description
+                    const ogDesc = document.querySelector('meta[property="og:description"]');
+                    if (ogDesc) {
+                        const content = ogDesc.getAttribute('content');
+                        // Filter out generic YouTube description
+                        if (content && !content.startsWith('Enjoy the videos and music')) return content;
+                    }
+                    // Try meta description
+                    const metaDesc = document.querySelector('meta[name="description"]');
+                    if (metaDesc) {
+                        const content = metaDesc.getAttribute('content');
+                        if (content && !content.startsWith('Enjoy the videos and music')) return content;
+                    }
+                    return null;
+                }""")
+            except Exception:
+                pass
+        
         hashtags = extract_hashtags_from_text(description)
         return {
             "video_id": video_id, "title": title, "description": description,
             "video_view_count": view_count, "like_count": like_count,
             "channel_id": channel_id, "channel_name": channel_name,
+            "channel_username": channel_username, "subscriber_count": subscriber_count,
             "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
             "video_url": url, "hashtags": hashtags, "content_type": "short", "data_source": "playwright_shorts"
         }
@@ -670,6 +855,146 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
             if channel_id_nav:
                 channel_id = channel_id or channel_id_nav.get("browseEndpoint", {}).get("browseId")
 
+        # DOM fallback for missing fields when ytInitialPlayerResponse is missing
+        # Extract uploadDate from #info-strings if not available
+        if not upload_date_iso:
+            try:
+                date_text = page.evaluate("""() => {
+                    // Try #info-strings first (common location for upload date)
+                    const infoStrings = document.querySelector('#info-strings yt-formatted-string');
+                    if (infoStrings) return infoStrings.innerText || infoStrings.textContent;
+                    // Fallback: look for date patterns in info container
+                    const info = document.querySelector('#info-container #info, #info');
+                    if (info) {
+                        const text = info.innerText || info.textContent || '';
+                        const dateMatch = text.match(/(\\w+\\s+\\d{1,2},\\s+\\d{4}|\\d{1,2}\\s+\\w+\\s+\\d{4})/);
+                        if (dateMatch) return dateMatch[0];
+                    }
+                    return null;
+                }""")
+                upload_date_iso = date_text or upload_date_iso
+            except Exception:
+                pass
+
+        # Extract channel_id from channel link href if still missing
+        if not channel_id:
+            try:
+                channel_id_from_href = page.evaluate("""() => {
+                    // Look for channel link with /channel/CHANNELID pattern
+                    const channelLink = document.querySelector('a[href*="/channel/"]');
+                    if (channelLink) {
+                        const match = channelLink.href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (match) return match[1];
+                    }
+                    // Also check owner links
+                    const ownerLink = document.querySelector('#owner a[href*="/channel/"], ytd-video-owner-renderer a[href*="/channel/"]');
+                    if (ownerLink) {
+                        const match = ownerLink.href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (match) return match[1];
+                    }
+                    return null;
+                }""")
+                channel_id = channel_id_from_href or channel_id
+            except Exception:
+                pass
+
+        # Extract channel_username (handle like @username) from DOM
+        channel_username = None
+        try:
+            channel_username = page.evaluate("""() => {
+                // Look for channel link with /@username pattern
+                const handleLink = document.querySelector('#owner a[href*="/@"], ytd-video-owner-renderer a[href*="/@"], a.yt-simple-endpoint[href*="/@"]');
+                if (handleLink) {
+                    const match = handleLink.href.match(/@([A-Za-z0-9_.-]+)/);
+                    if (match) return match[1];
+                }
+                // Check for custom URL displayed in owner area
+                const channelHandle = document.querySelector('#channel-handle, ytd-channel-name #text');
+                if (channelHandle) {
+                    const text = channelHandle.innerText || channelHandle.textContent || '';
+                    const match = text.match(/@([A-Za-z0-9_.-]+)/);
+                    if (match) return match[1];
+                }
+                return null;
+            }""")
+        except Exception:
+            pass
+
+        # Extract duration from DOM if still missing
+        if not duration_seconds:
+            try:
+                duration_text_dom = page.evaluate("""() => {
+                    // Try duration badge on video page
+                    const badge = document.querySelector('.ytp-time-duration');
+                    if (badge) return badge.innerText || badge.textContent;
+                    // Try video duration in structured data
+                    const ld = document.querySelector('script[type="application/ld+json"]');
+                    if (ld) {
+                        try {
+                            const data = JSON.parse(ld.textContent);
+                            if (data.duration) return data.duration;
+                        } catch(e) {}
+                    }
+                    return null;
+                }""")
+                if duration_text_dom:
+                    # Parse duration text like "10:30" or "1:02:45" or ISO 8601 like "PT10M30S"
+                    if duration_text_dom.startswith('PT'):
+                        duration_seconds = parse_iso8601_duration(duration_text_dom)
+                    else:
+                        parts = duration_text_dom.split(':')
+                        if len(parts) == 2:
+                            duration_seconds = int(parts[0]) * 60 + int(parts[1])
+                        elif len(parts) == 3:
+                            duration_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except Exception:
+                pass
+
+        # Extract like_count from DOM if still missing (YouTube's new like button format)
+        if not like_count:
+            try:
+                like_text = page.evaluate("""() => {
+                    // New YouTube like button format
+                    const likeBtn = document.querySelector('ytd-menu-renderer button[aria-label*="like"], like-button-view-model button, ytd-toggle-button-renderer[is-icon-button] button[aria-label*="like"]');
+                    if (likeBtn) {
+                        const label = likeBtn.getAttribute('aria-label');
+                        if (label) {
+                            const match = label.match(/([\\d,\\.]+[KMB]?)/i);
+                            if (match) return match[1];
+                        }
+                    }
+                    // Try segmented like button
+                    const segmented = document.querySelector('ytd-segmented-like-dislike-button-renderer');
+                    if (segmented) {
+                        const text = segmented.innerText || '';
+                        const match = text.match(/([\\d,\\.]+[KMB]?)/i);
+                        if (match) return match[1];
+                    }
+                    // Try like count span
+                    const likeCount = document.querySelector('#segmented-like-button span, .YtLikeButtonViewModelHost span');
+                    if (likeCount) return likeCount.innerText || likeCount.textContent;
+                    return null;
+                }""")
+                like_count = parse_count_text_to_int(like_text)
+            except Exception:
+                pass
+
+        # Extract subscriber_count from DOM (displayed in owner section)
+        subscriber_count = None
+        try:
+            sub_text = page.evaluate("""() => {
+                // Try owner subscriber count
+                const subCount = document.querySelector('#owner-sub-count, ytd-video-owner-renderer #owner-sub-count');
+                if (subCount) return subCount.innerText || subCount.textContent;
+                // Try channel header subscriber count
+                const headerSubs = document.querySelector('yt-formatted-string#subscriber-count');
+                if (headerSubs) return headerSubs.innerText || headerSubs.textContent;
+                return null;
+            }""")
+            subscriber_count = parse_count_text_to_int(sub_text)
+        except Exception:
+            pass
+
         hashtags = extract_hashtags_from_text(description)
 
         return {
@@ -686,6 +1011,8 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
             "comments_off": False,
             "channel_id": channel_id,
             "channel_name": channel_name,
+            "channel_username": channel_username,
+            "subscriber_count": subscriber_count,
             "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
             "video_url": url,
             "hashtags": hashtags,
@@ -971,6 +1298,8 @@ def normalize_search_video_types(input_options: Dict[str, Any]) -> List[str]:
       - searchVideoType: "any"|"video"|"shorts"|...
       - searchVideoTypes: ["shorts","video"] OR comma-separated string "video,shorts"
     Returns a normalized ordered list.
+    
+    Also considers per-type caps: if maxShortsPerTerm is 0, exclude 'shorts' from default types.
     """
     single = input_options.get("searchVideoType")
     multiple = input_options.get("searchVideoTypes")
@@ -988,14 +1317,37 @@ def normalize_search_video_types(input_options: Dict[str, Any]) -> List[str]:
         s = single.strip().lower()
         if s == "any":
             if not out:
-                return ["video", "shorts"]
+                # Check per-type caps to determine what to include
+                default_types = []
+                if input_options.get("maxVideosPerTerm", 10) > 0:
+                    default_types.append("video")
+                if input_options.get("maxShortsPerTerm", 0) > 0:
+                    default_types.append("shorts")
+                return default_types if default_types else ["video"]
+        elif s == "short":
+            # Normalize "short" to "shorts" for consistency
+            out = ["shorts"]
         else:
             if not out:
                 out = [s]
+    # Normalize any 'short' to 'shorts' in the final list
+    out = ["shorts" if t == "short" else t for t in out]
     if not out:
-        return ["video", "shorts"]
+        # Default behavior: check per-type caps
+        default_types = []
+        if input_options.get("maxVideosPerTerm", 10) > 0:
+            default_types.append("video")
+        if input_options.get("maxShortsPerTerm", 0) > 0:
+            default_types.append("shorts")
+        return default_types if default_types else ["video"]
     if "any" in out:
-        return ["video", "shorts"]
+        # Check per-type caps to determine what to include
+        default_types = []
+        if input_options.get("maxVideosPerTerm", 10) > 0:
+            default_types.append("video")
+        if input_options.get("maxShortsPerTerm", 0) > 0:
+            default_types.append("shorts")
+        return default_types if default_types else ["video"]
     return out
 
 
@@ -1031,13 +1383,21 @@ def gather_shorts_hrefs(page: Page) -> List[str]:
 
 
 def gather_regular_hrefs(page: Page) -> List[str]:
-    """Collect watch?v= links from various renderers and canonicalize them."""
+    """Collect watch?v= links from ytd-video-renderer elements, excluding shelf renderers (People also watched, Related)."""
     hrefs = []
     try:
         anchors = page.evaluate("""
             () => {
                 const out = new Set();
-                document.querySelectorAll('a#video-title, a#video-title-link, a[href*="/watch?v="]').forEach(a => { try { if (a.href) out.add(a.href); } catch(e){} });
+                // Target ytd-video-renderer specifically to avoid "People also watched" and "Related" shelves
+                document.querySelectorAll('ytd-video-renderer a#video-title, ytd-video-renderer a#video-title-link').forEach(a => {
+                    try {
+                        // Exclude if inside ytd-shelf-renderer (People also watched, Related, etc.)
+                        if (!a.closest('ytd-shelf-renderer') && a.href) {
+                            out.add(a.href);
+                        }
+                    } catch(e){}
+                });
                 return Array.from(out);
             }
         """) or []
@@ -1365,33 +1725,50 @@ def main():
             for d in raw_direct:
                 if isinstance(d, str): all_urls.append(d)
             search_terms = input_options.get("searchTerms") or []
+            
+            # Global cap on total results
+            global_max = int(input_options.get("maxResults", 50))
+            total_scraped = 0
+            
             if all_urls:
-                logging.info("PROCESSING %d START URLs", len(all_urls))
+                logging.info("PROCESSING %d START URLs (global max: %d)", len(all_urls), global_max)
                 for idx, url in enumerate(all_urls, 1):
                     if STOP_FLAG:
                         logging.info("Stop requested; exiting URL loop"); break
-                    logging.info("URL %d/%d: %s", idx, len(all_urls), url)
+                    if total_scraped >= global_max:
+                        logging.info("Reached global max of %d results; stopping URL processing", global_max)
+                        break
+                    logging.info("URL %d/%d: %s (total scraped so far: %d)", idx, len(all_urls), url, total_scraped)
                     try:
                         if is_channel_url(url):
-                            scrape_channel_all_videos(page, context, url, input_options)
+                            results = scrape_channel_all_videos(page, context, url, input_options)
+                            total_scraped += len(results) if results else 0
                         elif is_video_url(url):
-                            advanced_extract_video(page, context, url, {}, input_options)
+                            result = advanced_extract_video(page, context, url, {}, input_options)
+                            if result and result.get("id"):
+                                total_scraped += 1
                         else:
-                            scrape_search(page, context, url, input_options)
+                            results = scrape_search(page, context, url, input_options)
+                            total_scraped += len(results) if results else 0
                     except Exception as e:
                         logging.error("Failed URL %s: %s", url, e, exc_info=True)
-            if search_terms and not STOP_FLAG:
-                logging.info("PROCESSING %d SEARCH TERMS", len(search_terms))
+            if search_terms and not STOP_FLAG and total_scraped < global_max:
+                logging.info("PROCESSING %d SEARCH TERMS (global max: %d, already scraped: %d)", len(search_terms), global_max, total_scraped)
                 for idx, kw in enumerate(search_terms, 1):
                     if STOP_FLAG:
                         logging.info("Stop requested; exiting search loop"); break
-                    logging.info("SEARCH %d/%d: %s", idx, len(search_terms), kw)
+                    if total_scraped >= global_max:
+                        logging.info("Reached global max of %d results; stopping search processing", global_max)
+                        break
+                    logging.info("SEARCH %d/%d: %s (total scraped so far: %d)", idx, len(search_terms), kw, total_scraped)
                     try:
-                        scrape_search(page, context, kw, input_options)
+                        results = scrape_search(page, context, kw, input_options)
+                        total_scraped += len(results) if results else 0
                     except Exception as e:
                         logging.error("Search failed %s: %s", kw, e, exc_info=True)
             if not all_urls and not search_terms:
                 logging.warning("No startUrls/directUrls/searchTerms provided")
+            logging.info("TOTAL RESULTS SCRAPED: %d", total_scraped)
         except Exception as e:
             logging.error("Unhandled error: %s", e, exc_info=True)
             try_capture(page, key="FATAL_ERROR.png")
