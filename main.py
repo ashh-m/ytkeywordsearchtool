@@ -860,11 +860,12 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
         if not upload_date_iso:
             try:
                 date_text = page.evaluate("""() => {
-                    // Try structured data (ld+json) first - most reliable for upload date
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data (ld+json) - iterate through all scripts to find video data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
+                            // Check if this is video data (has @type VideoObject or uploadDate)
                             if (data.uploadDate) return data.uploadDate;
                             if (data.datePublished) return data.datePublished;
                         } catch(e) {}
@@ -895,9 +896,9 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
         if not channel_id:
             try:
                 channel_id_from_href = page.evaluate("""() => {
-                    // Try structured data (ld+json) first
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data (ld+json) - iterate through all scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
                             if (data.author && data.author.url) {
