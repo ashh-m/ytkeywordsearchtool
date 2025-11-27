@@ -613,10 +613,22 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                         const content = metaTitle.getAttribute('content');
                         if (content && content !== 'YouTube') return content;
                     }
+                    // Try shorts-specific title in overlay
+                    const shortsTitle = document.querySelector('ytd-reel-video-renderer h2, .reel-video-in-sequence .yt-core-attributed-string, ytd-shorts-player-page h2');
+                    if (shortsTitle) {
+                        const text = shortsTitle.innerText || shortsTitle.textContent || '';
+                        if (text && text !== 'YouTube') return text.trim();
+                    }
+                    // Try twitter:title meta
+                    const twitterTitle = document.querySelector('meta[name="twitter:title"]');
+                    if (twitterTitle) {
+                        const content = twitterTitle.getAttribute('content');
+                        if (content && content !== 'YouTube') return content;
+                    }
                     // Last resort: page title but filter out just "YouTube"
                     const pageTitle = document.title;
                     if (pageTitle && pageTitle !== 'YouTube' && !pageTitle.match(/^YouTube\\s*$/)) {
-                        return pageTitle.replace(/ - YouTube$/, '');
+                        return pageTitle.replace(/ - YouTube$/, '').replace(/#shorts/i, '').trim();
                     }
                     return null;
                 }""")
@@ -868,13 +880,49 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             except Exception:
                 pass
         
+        # Try to extract channel_id from structured data if still missing
+        if not channel_id:
+            try:
+                channel_id_from_dom = page.evaluate("""() => {
+                    // Try structured data first
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.author && data.author.url) {
+                                const channelMatch = data.author.url.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                                if (channelMatch) return channelMatch[1];
+                            }
+                        } catch(e) {}
+                    }
+                    // Try to find channel link in page
+                    const channelLinks = document.querySelectorAll('a[href*="/channel/"]');
+                    for (const link of channelLinks) {
+                        const match = link.href.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                        if (match) return match[1];
+                    }
+                    return null;
+                }""")
+                if channel_id_from_dom:
+                    channel_id = channel_id_from_dom
+            except Exception:
+                pass
+        
+        # Build channel_url - prefer channel_username handle, then channel_id
+        if channel_username:
+            channel_url = f"https://www.youtube.com/@{channel_username}"
+        elif channel_id:
+            channel_url = f"https://www.youtube.com/channel/{channel_id}"
+        else:
+            channel_url = None
+        
         hashtags = extract_hashtags_from_text(description)
         return {
             "video_id": video_id, "title": title, "description": description,
             "video_view_count": view_count, "upload_date_iso": upload_date_iso, "like_count": like_count,
             "comments_count": comments_count, "channel_id": channel_id, "channel_name": channel_name,
             "channel_username": channel_username, "subscriber_count": subscriber_count,
-            "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
+            "channel_url": channel_url,
             "video_url": url, "hashtags": hashtags, "content_type": "short", "data_source": "playwright_shorts"
         }
     except Exception as e:
@@ -1130,6 +1178,49 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
         except Exception:
             pass
 
+        # Extract comments_count from DOM (for regular videos)
+        if not comments_count:
+            try:
+                comments_text = page.evaluate("""() => {
+                    // Try comments count from ytInitialData
+                    // Try comments header
+                    const commentsHeader = document.querySelector('#comments #count, ytd-comments-header-renderer #count');
+                    if (commentsHeader) {
+                        const text = commentsHeader.innerText || commentsHeader.textContent || '';
+                        const match = text.match(/([\\d,\\.]+[KMB]?)/i);
+                        if (match) return match[1];
+                    }
+                    // Try from structured data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.commentCount !== undefined) return String(data.commentCount);
+                            if (data.interactionStatistic) {
+                                const stats = Array.isArray(data.interactionStatistic) ? data.interactionStatistic : [data.interactionStatistic];
+                                for (const stat of stats) {
+                                    if (stat['@type'] === 'InteractionCounter' && stat.interactionType && 
+                                        (stat.interactionType === 'CommentAction' || stat.interactionType['@type'] === 'CommentAction')) {
+                                        return String(stat.userInteractionCount);
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    // Try comments section title
+                    const commentsTitle = document.querySelector('ytd-comments-header-renderer h2, #comments-button .yt-spec-button-shape-next__button-text-content');
+                    if (commentsTitle) {
+                        const text = commentsTitle.innerText || commentsTitle.textContent || '';
+                        const match = text.match(/([\\d,\\.]+[KMB]?)/i);
+                        if (match) return match[1];
+                    }
+                    return null;
+                }""")
+                if comments_text:
+                    comments_count = parse_count_text_to_int(comments_text)
+            except Exception:
+                pass
+
         hashtags = extract_hashtags_from_text(description)
 
         return {
@@ -1165,14 +1256,19 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
 def build_unified_output(video: Dict[str, Any], channel: Optional[Dict[str, Any]] = None, **kwargs) -> Dict[str, Any]:
     ch = channel or {}
     handle = ch.get("channel_handle") or ch.get("custom_url")
-    channel_username = handle[1:] if handle and isinstance(handle, str) and handle.startswith("@") else handle
+    channel_username = video.get("channel_username") or (handle[1:] if handle and isinstance(handle, str) and handle.startswith("@") else handle)
     channel_id = ch.get("channel_id") or video.get("channel_id")
-    if handle and isinstance(handle, str) and handle.startswith("@"):
+    
+    # Build channel URL - prefer username handle, then channel_id
+    if channel_username:
+        channel_url = f"https://www.youtube.com/@{channel_username}"
+    elif handle and isinstance(handle, str) and handle.startswith("@"):
         channel_url = f"https://www.youtube.com/{handle}"
     elif channel_id:
         channel_url = f"https://www.youtube.com/channel/{channel_id}"
     else:
         channel_url = ch.get("channel_url") or video.get("channel_url")
+    
     thumb = video.get("thumbnail_url") or (f"https://i.ytimg.com/vi/{video.get('video_id')}/maxresdefault.jpg" if video.get("video_id") else None)
     vid_description = video.get("description") or ""
     vid_links = re.findall(r"(https?://[^\s<>]+)", vid_description)
@@ -1182,17 +1278,16 @@ def build_unified_output(video: Dict[str, Any], channel: Optional[Dict[str, Any]
         if l in seen: continue
         seen.add(l); unique_links.append({"url": l, "text": l})
     return {
-        "title": video.get("title"), "translatedTitle": None, "type": video.get("content_type", "video"),
+        "title": video.get("title"), "type": video.get("content_type", "video"),
         "id": video.get("video_id") or video.get("id"), "url": video.get("video_url") or video.get("url"),
         "thumbnailUrl": thumb, "viewCount": video.get("video_view_count"), "date": video.get("upload_date_iso"),
-        "likes": video.get("like_count"), "location": video.get("location"),
+        "likes": video.get("like_count"),
         "channelName": video.get("channel_name") or ch.get("title") or ch.get("channel_title"),
-        "channelUrl": channel_url, "channelUsername": video.get("channel_username") or channel_username,
-        "collaborators": None, "channelId": channel_id, "numberOfSubscribers": video.get("subscriber_count") or ch.get("subscriber_count"),
+        "channelUrl": channel_url, "channelUsername": channel_username,
+        "channelId": channel_id, "numberOfSubscribers": video.get("subscriber_count") or ch.get("subscriber_count"),
         "duration": video.get("duration_text"), "commentsCount": video.get("comments_count"),
-        "text": vid_description, "translatedText": None, "descriptionLinks": unique_links,
+        "text": vid_description, "descriptionLinks": unique_links,
         "hashtags": video.get("hashtags", []), "subtitles": video.get("subtitles"),
-        "isMonetized": bool(ch.get("is_monetized")) if ch.get("is_monetized") is not None else None,
         "commentsTurnedOff": bool(video.get("comments_off")) if video.get("comments_off") is not None else None
     }
 
