@@ -1298,6 +1298,8 @@ def normalize_search_video_types(input_options: Dict[str, Any]) -> List[str]:
       - searchVideoType: "any"|"video"|"shorts"|...
       - searchVideoTypes: ["shorts","video"] OR comma-separated string "video,shorts"
     Returns a normalized ordered list.
+    
+    Also considers per-type caps: if maxShortsPerTerm is 0, exclude 'shorts' from default types.
     """
     single = input_options.get("searchVideoType")
     multiple = input_options.get("searchVideoTypes")
@@ -1315,14 +1317,36 @@ def normalize_search_video_types(input_options: Dict[str, Any]) -> List[str]:
         s = single.strip().lower()
         if s == "any":
             if not out:
-                return ["video", "shorts"]
+                # Check per-type caps to determine what to include
+                default_types = []
+                if input_options.get("maxVideosPerTerm", 10) > 0:
+                    default_types.append("video")
+                if input_options.get("maxShortsPerTerm", 0) > 0:
+                    default_types.append("shorts")
+                return default_types if default_types else ["video"]
+        elif s == "short":
+            # Normalize "short" to "shorts" for consistency
+            if not out:
+                out = ["shorts"]
         else:
             if not out:
                 out = [s]
     if not out:
-        return ["video", "shorts"]
+        # Default behavior: check per-type caps
+        default_types = []
+        if input_options.get("maxVideosPerTerm", 10) > 0:
+            default_types.append("video")
+        if input_options.get("maxShortsPerTerm", 0) > 0:
+            default_types.append("shorts")
+        return default_types if default_types else ["video"]
     if "any" in out:
-        return ["video", "shorts"]
+        # Check per-type caps to determine what to include
+        default_types = []
+        if input_options.get("maxVideosPerTerm", 10) > 0:
+            default_types.append("video")
+        if input_options.get("maxShortsPerTerm", 0) > 0:
+            default_types.append("shorts")
+        return default_types if default_types else ["video"]
     return out
 
 
@@ -1700,33 +1724,50 @@ def main():
             for d in raw_direct:
                 if isinstance(d, str): all_urls.append(d)
             search_terms = input_options.get("searchTerms") or []
+            
+            # Global cap on total results
+            global_max = int(input_options.get("maxResults", 50))
+            total_scraped = 0
+            
             if all_urls:
-                logging.info("PROCESSING %d START URLs", len(all_urls))
+                logging.info("PROCESSING %d START URLs (global max: %d)", len(all_urls), global_max)
                 for idx, url in enumerate(all_urls, 1):
                     if STOP_FLAG:
                         logging.info("Stop requested; exiting URL loop"); break
-                    logging.info("URL %d/%d: %s", idx, len(all_urls), url)
+                    if total_scraped >= global_max:
+                        logging.info("Reached global max of %d results; stopping URL processing", global_max)
+                        break
+                    logging.info("URL %d/%d: %s (total scraped so far: %d)", idx, len(all_urls), url, total_scraped)
                     try:
                         if is_channel_url(url):
-                            scrape_channel_all_videos(page, context, url, input_options)
+                            results = scrape_channel_all_videos(page, context, url, input_options)
+                            total_scraped += len(results) if results else 0
                         elif is_video_url(url):
-                            advanced_extract_video(page, context, url, {}, input_options)
+                            result = advanced_extract_video(page, context, url, {}, input_options)
+                            if result and result.get("id"):
+                                total_scraped += 1
                         else:
-                            scrape_search(page, context, url, input_options)
+                            results = scrape_search(page, context, url, input_options)
+                            total_scraped += len(results) if results else 0
                     except Exception as e:
                         logging.error("Failed URL %s: %s", url, e, exc_info=True)
-            if search_terms and not STOP_FLAG:
-                logging.info("PROCESSING %d SEARCH TERMS", len(search_terms))
+            if search_terms and not STOP_FLAG and total_scraped < global_max:
+                logging.info("PROCESSING %d SEARCH TERMS (global max: %d, already scraped: %d)", len(search_terms), global_max, total_scraped)
                 for idx, kw in enumerate(search_terms, 1):
                     if STOP_FLAG:
                         logging.info("Stop requested; exiting search loop"); break
-                    logging.info("SEARCH %d/%d: %s", idx, len(search_terms), kw)
+                    if total_scraped >= global_max:
+                        logging.info("Reached global max of %d results; stopping search processing", global_max)
+                        break
+                    logging.info("SEARCH %d/%d: %s (total scraped so far: %d)", idx, len(search_terms), kw, total_scraped)
                     try:
-                        scrape_search(page, context, kw, input_options)
+                        results = scrape_search(page, context, kw, input_options)
+                        total_scraped += len(results) if results else 0
                     except Exception as e:
                         logging.error("Search failed %s: %s", kw, e, exc_info=True)
             if not all_urls and not search_terms:
                 logging.warning("No startUrls/directUrls/searchTerms provided")
+            logging.info("TOTAL RESULTS SCRAPED: %d", total_scraped)
         except Exception as e:
             logging.error("Unhandled error: %s", e, exc_info=True)
             try_capture(page, key="FATAL_ERROR.png")
