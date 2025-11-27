@@ -535,7 +535,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
     """
     logging.info("Extracting metadata for SHORT: %s", video_id)
     
-    # Fix 4: Try API first for shorts (same as regular videos)
+    # Try API first for shorts (same as regular videos)
     api_data = get_video_details_from_api(video_id)
     if api_data:
         logging.info("Using YouTube API for shorts metadata: %s", video_id)
@@ -583,7 +583,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_name = channel_name or vd.get("author")
                 channel_id = channel_id or vd.get("channelId")
             
-            # Fix 1: Extract date from microformat (multiple sources)
+            # Extract date from microformat (multiple sources)
             microformat = player_json.get("microformat", {}).get("playerMicroformatRenderer", {}) or {}
             if microformat:
                 upload_date_iso = upload_date_iso or microformat.get("publishDate") or microformat.get("uploadDate")
