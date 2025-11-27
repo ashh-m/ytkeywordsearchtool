@@ -860,9 +860,25 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
         if not upload_date_iso:
             try:
                 date_text = page.evaluate("""() => {
-                    // Try #info-strings first (common location for upload date)
+                    // Try structured data (ld+json) - iterate through all scripts to find video data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            // Check if this is video data (has @type VideoObject or uploadDate)
+                            if (data.uploadDate) return data.uploadDate;
+                            if (data.datePublished) return data.datePublished;
+                        } catch(e) {}
+                    }
+                    // Try #info-strings (common location for upload date)
                     const infoStrings = document.querySelector('#info-strings yt-formatted-string');
                     if (infoStrings) return infoStrings.innerText || infoStrings.textContent;
+                    // Try publish date meta tag
+                    const publishDate = document.querySelector('meta[itemprop="uploadDate"], meta[itemprop="datePublished"]');
+                    if (publishDate) {
+                        const content = publishDate.getAttribute('content');
+                        if (content) return content;
+                    }
                     // Fallback: look for date patterns in info container
                     const info = document.querySelector('#info-container #info, #info');
                     if (info) {
@@ -880,6 +896,17 @@ def extract_video_metadata_hybrid(video_id: str, url: str, page: Page = None) ->
         if not channel_id:
             try:
                 channel_id_from_href = page.evaluate("""() => {
+                    // Try structured data (ld+json) - iterate through all scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.author && data.author.url) {
+                                const channelMatch = data.author.url.match(/\\/channel\\/([A-Za-z0-9_-]+)/);
+                                if (channelMatch) return channelMatch[1];
+                            }
+                        } catch(e) {}
+                    }
                     // Look for channel link with /channel/CHANNELID pattern
                     const channelLink = document.querySelector('a[href*="/channel/"]');
                     if (channelLink) {
@@ -1389,12 +1416,15 @@ def gather_regular_hrefs(page: Page) -> List[str]:
         anchors = page.evaluate("""
             () => {
                 const out = new Set();
-                // Target ytd-video-renderer specifically to avoid "People also watched" and "Related" shelves
-                document.querySelectorAll('ytd-video-renderer a#video-title, ytd-video-renderer a#video-title-link').forEach(a => {
+                // Target ytd-video-renderer specifically and exclude those inside shelf renderers
+                document.querySelectorAll('ytd-video-renderer').forEach(renderer => {
                     try {
-                        // Exclude if inside ytd-shelf-renderer (People also watched, Related, etc.)
-                        if (!a.closest('ytd-shelf-renderer') && a.href) {
-                            out.add(a.href);
+                        // Exclude if ytd-video-renderer is inside ytd-shelf-renderer (People also watched, Related, etc.)
+                        if (renderer.closest('ytd-shelf-renderer')) return;
+                        // Find the video title link within this renderer
+                        const link = renderer.querySelector('a#video-title, a#video-title-link');
+                        if (link && link.href) {
+                            out.add(link.href);
                         }
                     } catch(e){}
                 });
