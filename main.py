@@ -151,6 +151,14 @@ def parse_iso8601_duration(duration_str: str) -> Optional[int]:
 # -----------------------
 # Utilities
 # -----------------------
+def is_valid_channel_name(name: Optional[str]) -> bool:
+    """Check if a channel name is valid (not 'Shopping', 'YouTube', or empty)."""
+    if not name:
+        return False
+    lower_name = name.lower().strip()
+    return lower_name not in ['shopping', 'youtube', '']
+
+
 def parse_count_text_to_int(text: Optional[str]) -> Optional[int]:
     if not text:
         return None
@@ -589,10 +597,8 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                     for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
-                            // Check for VideoObject type or name field
-                            if (data['@type'] === 'VideoObject' || data.name) {
-                                if (data.name) return data.name;
-                            }
+                            // Check for name field (VideoObject will have this)
+                            if (data.name) return data.name;
                         } catch(e) {}
                     }
                     // Try og:title meta tag
@@ -666,7 +672,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 pass
         
         # Extract channel info - be very specific to avoid "Shopping" or other buttons
-        if not channel_name or channel_name.lower() == 'shopping':
+        if not is_valid_channel_name(channel_name):
             try:
                 channel_info = page.evaluate("""() => {
                     // Look specifically in the shorts player overlay for channel info
@@ -700,7 +706,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                     return null;
                 }""")
                 if channel_info and isinstance(channel_info, dict):
-                    if channel_info.get('name') and channel_info['name'].lower() not in ['shopping', 'youtube']:
+                    if is_valid_channel_name(channel_info.get('name')):
                         channel_name = channel_info['name']
                     if channel_info.get('href'):
                         # Extract channel_id and username from href
@@ -1238,7 +1244,8 @@ def advanced_extract_video(page: Page, context: BrowserContext, url: str, channe
                     for sel in shorts_selectors:
                         try:
                             el = page.locator(sel).first
-                            if el and el.is_visible(timeout=2000):
+                            # Use shorter timeout (500ms) to avoid cumulative delays
+                            if el and el.is_visible(timeout=500):
                                 shorts_ready = True
                                 break
                         except Exception:
@@ -1464,7 +1471,7 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
     # Apply overall cap
     if len(all_urls) > overall_cap:
         # Proportionally distribute the cap if we have both types
-        if video_urls and shorts_urls:
+        if video_urls and shorts_urls and len(all_urls) > 0:
             # Keep ratio but respect overall cap
             video_ratio = len(video_urls) / len(all_urls)
             video_keep = min(len(video_urls), max(1, int(overall_cap * video_ratio)))
