@@ -531,6 +531,27 @@ def extract_subtitles(page: Page) -> Optional[List[Dict[str, Any]]]:
 
 def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, Any]:
     logging.info("Extracting metadata for SHORT: %s", video_id)
+    
+    # Try YouTube API first (same as regular videos) - most reliable source
+    api_data = get_video_details_from_api(video_id)
+    if api_data:
+        thumbnails = api_data.get("thumbnails", {})
+        thumbnail = thumbnails.get("maxres", {}).get("url") or thumbnails.get("high", {}).get("url") or f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"
+        channel_id = api_data.get("channel_id")
+        return {
+            "video_id": video_id, "title": api_data.get("title"), "description": api_data.get("description"),
+            "video_view_count": api_data.get("view_count"), "upload_date_iso": api_data.get("published_at"),
+            "duration_seconds": api_data.get("duration_seconds"), "duration_text": seconds_to_hms(api_data.get("duration_seconds")),
+            "thumbnail_url": thumbnail, "like_count": api_data.get("like_count"), "comments_count": api_data.get("comment_count"),
+            "comments_off": api_data.get("comments_disabled", False), "channel_id": channel_id,
+            "channel_name": api_data.get("channel_title"),
+            "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
+            "video_url": url, "hashtags": extract_hashtags_from_text(api_data.get("description")), "content_type": "short",
+            "data_source": "youtube_api"
+        }
+    
+    logging.debug("API data not available for short %s; using Playwright extraction", video_id)
+    
     try:
         initial = try_get_initial_data(page)
         player_json = try_get_player_json(page)
@@ -538,7 +559,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if initial:
             overlay = find_nested_key(initial, "reelPlayerOverlayRenderer") or find_nested_key(initial, "shortsPlayerOverlayRenderer")
         title = None; view_count = None; like_count = None; channel_name = None; channel_id = None; description = None
-        channel_username = None; subscriber_count = None
+        channel_username = None; subscriber_count = None; upload_date_iso = None; comments_count = None
         
         # Try to get data from player_json.videoDetails first (most reliable)
         if player_json and isinstance(player_json, dict):
@@ -559,16 +580,19 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_id = channel_id or ch.get("browseEndpoint", {}).get("browseId")
             channel_name = channel_name or _text_from(find_nested_key(overlay, "channelTitleText"))
         
-        # Try structured data (ld+json) for title - more reliable than document.title
+        # Try structured data (ld+json) for title - iterate ALL script tags to find video data
         if not title:
             try:
                 title = page.evaluate("""() => {
-                    // Try structured data first
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data - iterate ALL ld+json scripts to find video data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
-                            if (data.name) return data.name;
+                            // Check for VideoObject type or name field
+                            if (data['@type'] === 'VideoObject' || data.name) {
+                                if (data.name) return data.name;
+                            }
                         } catch(e) {}
                     }
                     // Try og:title meta tag
@@ -655,9 +679,9 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                             return {name: text, href: link.href};
                         }
                     }
-                    // Try structured data
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data - iterate ALL ld+json scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
                             if (data.author && data.author.name) {
@@ -702,9 +726,9 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                         const match = link.href.match(/@([A-Za-z0-9_.-]+)/);
                         if (match) return match[1];
                     }
-                    // Try structured data
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data - iterate ALL ld+json scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
                             if (data.author && data.author.url) {
@@ -734,9 +758,9 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if not description:
             try:
                 description = page.evaluate("""() => {
-                    // Try structured data first
-                    const ldJson = document.querySelector('script[type="application/ld+json"]');
-                    if (ldJson) {
+                    // Try structured data - iterate ALL ld+json scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
                         try {
                             const data = JSON.parse(ldJson.textContent);
                             if (data.description) return data.description;
@@ -760,11 +784,89 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             except Exception:
                 pass
         
+        # Extract upload date from structured data or meta tags
+        if not upload_date_iso:
+            try:
+                upload_date_iso = page.evaluate("""() => {
+                    // Try structured data - iterate ALL ld+json scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.uploadDate) return data.uploadDate;
+                            if (data.datePublished) return data.datePublished;
+                        } catch(e) {}
+                    }
+                    // Try meta tags for upload date
+                    const uploadDate = document.querySelector('meta[itemprop="uploadDate"], meta[itemprop="datePublished"]');
+                    if (uploadDate) {
+                        const content = uploadDate.getAttribute('content');
+                        if (content) return content;
+                    }
+                    // Try og:publish_date or article:published_time
+                    const ogDate = document.querySelector('meta[property="og:publish_date"], meta[property="article:published_time"]');
+                    if (ogDate) {
+                        const content = ogDate.getAttribute('content');
+                        if (content) return content;
+                    }
+                    return null;
+                }""")
+            except Exception:
+                pass
+        
+        # Extract comments count from structured data or DOM
+        if not comments_count:
+            try:
+                comments_count_raw = page.evaluate("""() => {
+                    // Try structured data - iterate ALL ld+json scripts
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.commentCount !== undefined) return data.commentCount;
+                            if (data.interactionStatistic) {
+                                // Could be array or single object
+                                const stats = Array.isArray(data.interactionStatistic) ? data.interactionStatistic : [data.interactionStatistic];
+                                for (const stat of stats) {
+                                    if (stat['@type'] === 'InteractionCounter' && stat.interactionType && 
+                                        (stat.interactionType === 'CommentAction' || stat.interactionType['@type'] === 'CommentAction')) {
+                                        return stat.userInteractionCount;
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    // Try comments button aria-label on shorts
+                    const commentsBtn = document.querySelector('button[aria-label*="comment" i], ytd-button-renderer[aria-label*="comment" i]');
+                    if (commentsBtn) {
+                        const label = commentsBtn.getAttribute('aria-label') || '';
+                        const match = label.match(/([\\d,\\.]+[KMB]?)/i);
+                        if (match) return match[1];
+                    }
+                    // Try looking for comments count text
+                    const commentElements = document.querySelectorAll('[id*="comment"] span, .comment-count');
+                    for (const el of commentElements) {
+                        const text = el.innerText || el.textContent || '';
+                        if (/\\d/.test(text) && /comment/i.test(text)) {
+                            const match = text.match(/([\\d,\\.]+[KMB]?)/i);
+                            if (match) return match[1];
+                        }
+                    }
+                    return null;
+                }""")
+                if comments_count_raw is not None:
+                    if isinstance(comments_count_raw, (int, float)):
+                        comments_count = int(comments_count_raw)
+                    else:
+                        comments_count = parse_count_text_to_int(str(comments_count_raw))
+            except Exception:
+                pass
+        
         hashtags = extract_hashtags_from_text(description)
         return {
             "video_id": video_id, "title": title, "description": description,
-            "video_view_count": view_count, "like_count": like_count,
-            "channel_id": channel_id, "channel_name": channel_name,
+            "video_view_count": view_count, "upload_date_iso": upload_date_iso, "like_count": like_count,
+            "comments_count": comments_count, "channel_id": channel_id, "channel_name": channel_name,
             "channel_username": channel_username, "subscriber_count": subscriber_count,
             "channel_url": f"https://www.youtube.com/channel/{channel_id}" if channel_id else None,
             "video_url": url, "hashtags": hashtags, "content_type": "short", "data_source": "playwright_shorts"
@@ -1112,11 +1214,45 @@ def advanced_extract_video(page: Page, context: BrowserContext, url: str, channe
         # Always navigate when target is a shorts URL — Playwright DOM is needed for shorts metadata.
         if is_shorts_url(nav_url):
             goto_and_ready(page, nav_url)
-            # attempt to wait for ytInitial* or overlay
-            try:
-                page.wait_for_function("() => Boolean(window.ytInitialPlayerResponse) || Boolean(window.ytInitialData)", timeout=12000)
-            except Exception:
-                logging.debug("Shorts page didn't expose ytInitial* quickly — continuing with DOM extraction")
+            # Wait for shorts-specific elements to be present before extraction
+            # Try multiple selectors for shorts overlay/player
+            shorts_ready = False
+            for _ in range(3):  # Retry up to 3 times
+                try:
+                    # Wait for ytInitialPlayerResponse or ytInitialData first
+                    page.wait_for_function("() => Boolean(window.ytInitialPlayerResponse) || Boolean(window.ytInitialData)", timeout=8000)
+                    shorts_ready = True
+                    break
+                except Exception:
+                    pass
+                
+                # Also try waiting for shorts-specific DOM elements
+                try:
+                    shorts_selectors = [
+                        "ytd-reel-video-renderer",
+                        ".ytd-reel-player-overlay-renderer",
+                        "ytd-shorts",
+                        "#shorts-player",
+                        "[page-subtype='shorts']"
+                    ]
+                    for sel in shorts_selectors:
+                        try:
+                            el = page.locator(sel).first
+                            if el and el.is_visible(timeout=2000):
+                                shorts_ready = True
+                                break
+                        except Exception:
+                            continue
+                    if shorts_ready:
+                        break
+                except Exception:
+                    pass
+                
+                # Small wait before retry
+                page.wait_for_timeout(1000)
+            
+            if not shorts_ready:
+                logging.debug("Shorts page didn't expose ytInitial* or overlay elements — continuing with best-effort extraction")
         else:
             # Non-shorts: only navigate automatically when no API key (we rely on API if present)
             if not YOUTUBE_API_KEY:
@@ -1139,8 +1275,13 @@ def advanced_extract_video(page: Page, context: BrowserContext, url: str, channe
         logging.error("Navigation failed for %s: %s", nav_url, e)
         return {"video_id": video_id, "video_url": url, "data_source": "error"}
 
-    # Perform hybrid extraction (API preferred)
-    meta = extract_video_metadata_hybrid(video_id, nav_url, page=(None if YOUTUBE_API_KEY else page))
+    # Perform hybrid extraction
+    # For shorts: always pass page since extract_shorts_metadata has its own API fallback
+    # For regular videos: pass page only if no API key (API preferred for regular videos)
+    if is_shorts_url(nav_url):
+        meta = extract_video_metadata_hybrid(video_id, nav_url, page=page)
+    else:
+        meta = extract_video_metadata_hybrid(video_id, nav_url, page=(None if YOUTUBE_API_KEY else page))
 
     # Subtitles: only for non-shorts (shorts transcript rarely available)
     if meta.get("data_source") not in ["playwright_shorts"] and input_options.get("downloadSubtitles"):
@@ -1178,133 +1319,171 @@ def advanced_extract_video(page: Page, context: BrowserContext, url: str, channe
 def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: str, input_options: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Navigate to a channel and collect video + shorts links.
-    - Tries /videos, /shorts and the original URL variants.
-    - If the user requests shorts in searchVideoTypes (or searchVideoType includes 'shorts'),
-      prefers trying the /shorts candidate first so shorts anchors are discovered on channel pages.
+    - When both video and shorts types are requested, navigate to BOTH /videos and /shorts tabs
+      to collect URLs from each, then merge them.
+    - Uses per-type caps (maxVideosPerTerm, maxShortsPerTerm) to limit collection from each tab.
     """
     global STOP_FLAG
 
     base = channel_url.split('?')[0]
     videos_candidate = base.rstrip("/") + "/videos"
     shorts_candidate = base.rstrip("/") + "/shorts"
-    # prefer explicit shorts candidate when user explicitly asked for shorts
+    
+    # Determine which types the user wants
     types = normalize_search_video_types(input_options)
-    tried_urls: List[str] = []
+    want_videos = "video" in types
+    want_shorts = "shorts" in types
+    
+    # Per-type caps
+    videos_cap = int(input_options.get("maxVideosPerTerm", input_options.get("maxResults", 10))) if want_videos else 0
+    shorts_cap = int(input_options.get("maxShortsPerTerm", input_options.get("maxResults", 10))) if want_shorts else 0
+    overall_cap = int(input_options.get("maxResults", 10))
+    
+    logging.info("  Channel scrape types=%s, videos_cap=%d, shorts_cap=%d, overall_cap=%d", types, videos_cap, shorts_cap, overall_cap)
+    
+    links_seen: Set[str] = set()
+    video_urls: List[str] = []  # regular videos (watch?v=)
+    shorts_urls: List[str] = []  # shorts (/shorts/)
+    
+    def collect_urls_from_page(target_cap: int, url_type: str) -> List[str]:
+        """Scroll and collect URLs from current page, filtering by type."""
+        collected: List[str] = []
+        rounds = 0
+        max_rounds = 60
+        
+        while len(collected) < target_cap and rounds < max_rounds and not STOP_FLAG:
+            try:
+                hrefs = page.evaluate("""
+                    () => {
+                        const out = new Set();
+                        const sel = [
+                            'a#video-title',
+                            'a#video-title-link',
+                            'a[href*="/watch?v="]',
+                            'a[href*="/shorts/"]',
+                            'ytd-reel-item-renderer a[href*="/shorts/"]',
+                            'ytd-reel-shelf-renderer a[href*="/shorts/"]'
+                        ];
+                        sel.forEach(s => {
+                            document.querySelectorAll(s).forEach(a => {
+                                try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
+                            });
+                        });
+                        // fallback: look for any href attributes that include /shorts/ or watch?v=
+                        document.querySelectorAll('[href*="/shorts/"], a[href*="/watch?v="]').forEach(a => {
+                            try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
+                        });
+                        return Array.from(out);
+                    }
+                """) or []
+            except Exception:
+                hrefs = []
 
-    if "shorts" in types:
-        tried_urls = [shorts_candidate, videos_candidate, channel_url]
-    else:
-        # prefer /videos then /shorts, then the original
-        tried_urls = [videos_candidate, shorts_candidate, channel_url]
+            for h in hrefs:
+                if STOP_FLAG or len(collected) >= target_cap:
+                    break
+                try:
+                    full = h if h.startswith("http") else f"https://www.youtube.com{h}"
+                    full = clean_video_url(full)
+                    vid = extract_video_id(full)
+                    if not vid:
+                        continue
+                    if full in links_seen:
+                        continue
+                    
+                    # Filter by URL type
+                    is_short = "/shorts/" in full
+                    if url_type == "shorts" and not is_short:
+                        continue
+                    if url_type == "video" and is_short:
+                        continue
+                    
+                    links_seen.add(full)
+                    collected.append(full)
+                except Exception:
+                    continue
 
-    # dedupe while preserving order
-    seen_try = set()
-    tried = []
-    for u in tried_urls:
-        if u and u not in seen_try:
-            seen_try.add(u); tried.append(u)
-
-    logging.info("  Attempting to open channel pages (including /shorts): %s", tried)
-
-    used_url = None
-    for url in tried:
+            if len(collected) >= target_cap:
+                break
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(350)
+            rounds += 1
+        
+        return collected
+    
+    def try_navigate_to_tab(url: str) -> bool:
+        """Try to navigate to a channel tab and return success."""
         try:
             goto_and_ready(page, url)
             if is_page_unavailable(page):
-                logging.info("  Candidate %s reports unavailable; trying next", url)
-                continue
-            # if page contains reel/shorts or grid, accept it
+                logging.info("  Candidate %s reports unavailable", url)
+                return False
+            # Check if page has content
             try:
-                ok = page.locator("ytd-reel-shelf-renderer, ytd-rich-grid-renderer, ytd-browse, ytd-section-list-renderer").first
+                ok = page.locator("ytd-reel-shelf-renderer, ytd-rich-grid-renderer, ytd-browse, ytd-section-list-renderer, ytd-grid-video-renderer").first
                 if ok and ok.is_visible(timeout=2500):
-                    used_url = url
-                    logging.info("  Using channel page: %s", url)
-                    break
+                    return True
             except Exception:
-                # accept any non-unavailable page
-                used_url = url
-                logging.info("  Using candidate page (selector check failed): %s", url)
-                break
+                pass
+            # Accept any non-unavailable page
+            return True
         except Exception as e:
-            logging.warning("  Failed to open candidate %s: %s", url, e)
-            continue
+            logging.warning("  Failed to open %s: %s", url, e)
+            return False
 
+    # When both types are requested, collect from BOTH tabs separately
+    if want_videos and videos_cap > 0:
+        logging.info("  Collecting regular videos from /videos tab (cap=%d)...", videos_cap)
+        if try_navigate_to_tab(videos_candidate):
+            video_urls = collect_urls_from_page(videos_cap, "video")
+            logging.info("  Collected %d regular video URLs from /videos tab", len(video_urls))
+        else:
+            # Fallback: try original channel URL for videos
+            if try_navigate_to_tab(channel_url):
+                video_urls = collect_urls_from_page(videos_cap, "video")
+                logging.info("  Collected %d regular video URLs from channel home", len(video_urls))
+    
+    if STOP_FLAG:
+        return []
+    
+    if want_shorts and shorts_cap > 0:
+        logging.info("  Collecting shorts from /shorts tab (cap=%d)...", shorts_cap)
+        if try_navigate_to_tab(shorts_candidate):
+            shorts_urls = collect_urls_from_page(shorts_cap, "shorts")
+            logging.info("  Collected %d shorts URLs from /shorts tab", len(shorts_urls))
+        else:
+            # Shorts tab may not exist or be empty - that's OK
+            logging.info("  Could not access /shorts tab or no shorts found")
+    
     if STOP_FLAG:
         return []
 
-    if not used_url:
-        logging.warning("  No usable channel page found for %s — skipping shorts/video collection", channel_url)
-        return []
-
-    # Collect both watch and shorts anchors (canonicalized)
-    links_seen = set()
-    video_urls: List[str] = []
-    rounds = 0
-    cap = int(input_options.get("maxResults", 10))
-    logging.info("  Collecting up to %d video/shorts URLs from %s ...", cap, used_url)
-
-    while len(video_urls) < cap and rounds < 60 and not STOP_FLAG:
-        try:
-            hrefs = page.evaluate("""
-                () => {
-                    const out = new Set();
-                    const sel = [
-                        'a#video-title',
-                        'a#video-title-link',
-                        'a[href*="/watch?v="]',
-                        'a[href*="/shorts/"]',
-                        'ytd-reel-item-renderer a[href*="/shorts/"]',
-                        'ytd-reel-shelf-renderer a[href*="/shorts/"]'
-                    ];
-                    sel.forEach(s => {
-                        document.querySelectorAll(s).forEach(a => {
-                            try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                        });
-                    });
-                    // fallback: look for any href attributes that include /shorts/ or watch?v=
-                    document.querySelectorAll('[href*="/shorts/"], a[href*="/watch?v="]').forEach(a => {
-                        try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                    });
-                    return Array.from(out);
-                }
-            """) or []
-        except Exception:
-            hrefs = []
-
-        for h in hrefs:
-            if STOP_FLAG or len(video_urls) >= cap:
-                break
-            try:
-                full = h if h.startswith("http") else f"https://www.youtube.com{h}"
-                full = clean_video_url(full)
-                vid = extract_video_id(full)
-                if not vid:
-                    continue
-                if full not in links_seen:
-                    links_seen.add(full)
-                    video_urls.append(full)
-                    if len(video_urls) >= cap:
-                        break
-            except Exception:
-                continue
-
-        if len(video_urls) >= cap:
-            break
-        page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(350)
-        rounds += 1
-
+    # Merge collected URLs (videos first, then shorts)
+    all_urls = video_urls + shorts_urls
+    
+    # Apply overall cap
+    if len(all_urls) > overall_cap:
+        # Proportionally distribute the cap if we have both types
+        if video_urls and shorts_urls:
+            # Keep ratio but respect overall cap
+            video_ratio = len(video_urls) / len(all_urls)
+            video_keep = min(len(video_urls), max(1, int(overall_cap * video_ratio)))
+            shorts_keep = min(len(shorts_urls), overall_cap - video_keep)
+            all_urls = video_urls[:video_keep] + shorts_urls[:shorts_keep]
+        else:
+            all_urls = all_urls[:overall_cap]
+    
     # Defensive: ensure only valid ids remain
-    video_urls = [u for u in video_urls if extract_video_id(u)]
-    logging.info("  Collected %d candidate URLs (shorts + watch) from %s", len(video_urls), used_url)
+    all_urls = [u for u in all_urls if extract_video_id(u)]
+    logging.info("  Total collected %d candidate URLs (videos=%d, shorts=%d)", len(all_urls), len([u for u in all_urls if "/shorts/" not in u]), len([u for u in all_urls if "/shorts/" in u]))
 
     # Proceed to extract each video/short
     out_rows: List[Dict[str, Any]] = []
     channel_cache: Dict[str, Dict[str, Any]] = {}
-    for idx, video_url in enumerate(video_urls[:cap], 1):
+    for idx, video_url in enumerate(all_urls, 1):
         if STOP_FLAG:
             break
-        logging.info("  Processing video %d/%d: %s", idx, len(video_urls), video_url)
+        logging.info("  Processing video %d/%d: %s", idx, len(all_urls), video_url)
         try:
             row = advanced_extract_video(page, context, video_url, channel_cache, input_options)
             if row and row.get("id"):
