@@ -1326,11 +1326,12 @@ def normalize_search_video_types(input_options: Dict[str, Any]) -> List[str]:
                 return default_types if default_types else ["video"]
         elif s == "short":
             # Normalize "short" to "shorts" for consistency
-            if not out:
-                out = ["shorts"]
+            out = ["shorts"]
         else:
             if not out:
                 out = [s]
+    # Normalize any 'short' to 'shorts' in the final list
+    out = ["shorts" if t == "short" else t for t in out]
     if not out:
         # Default behavior: check per-type caps
         default_types = []
