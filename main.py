@@ -600,6 +600,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             overlay = find_nested_key(initial, "reelPlayerOverlayRenderer") or find_nested_key(initial, "shortsPlayerOverlayRenderer")
         title = None; view_count = None; like_count = None; channel_name = None; channel_id = None; description = None
         channel_username = None; subscriber_count = None; upload_date_iso = None; comments_count = None
+        duration_seconds = None
         
         # Try to get data from player_json.videoDetails first (most reliable)
         if player_json and isinstance(player_json, dict):
@@ -610,6 +611,11 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 view_count = view_count or (int(vd.get("viewCount")) if vd.get("viewCount") and str(vd.get("viewCount")).isdigit() else parse_count_text_to_int(vd.get("viewCount")))
                 channel_name = channel_name or vd.get("author")
                 channel_id = channel_id or vd.get("channelId")
+                # Extract duration
+                try:
+                    duration_seconds = duration_seconds or (int(vd.get("lengthSeconds")) if vd.get("lengthSeconds") else None)
+                except Exception:
+                    pass
             
             # Extract date from microformat (multiple sources)
             microformat = player_json.get("microformat", {}).get("playerMicroformatRenderer", {}) or {}
@@ -1049,6 +1055,36 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             except Exception:
                 pass
         
+        # Extract duration from DOM if still missing
+        if not duration_seconds:
+            try:
+                duration_text_dom = page.evaluate("""() => {
+                    // Try duration from structured data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.duration) return data.duration;
+                        } catch(e) {}
+                    }
+                    // Try video player duration display
+                    const badge = document.querySelector('.ytp-time-duration');
+                    if (badge) return badge.innerText || badge.textContent;
+                    return null;
+                }""")
+                if duration_text_dom:
+                    # Parse duration text like "10:30" or "1:02:45" or ISO 8601 like "PT10M30S"
+                    if duration_text_dom.startswith('PT'):
+                        duration_seconds = parse_iso8601_duration(duration_text_dom)
+                    else:
+                        parts = duration_text_dom.split(':')
+                        if len(parts) == 2:
+                            duration_seconds = int(parts[0]) * 60 + int(parts[1])
+                        elif len(parts) == 3:
+                            duration_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except Exception:
+                pass
+        
         # Build channel_url - prefer channel_username handle, then channel_id
         if channel_username:
             channel_url = f"https://www.youtube.com/@{channel_username}"
@@ -1059,15 +1095,26 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         
         hashtags = extract_hashtags_from_text(description)
         return {
-            "video_id": video_id, "title": title, "description": description,
-            "video_view_count": view_count, "upload_date_iso": upload_date_iso, "like_count": like_count,
-            "comments_count": comments_count, "channel_id": channel_id, "channel_name": channel_name,
-            "video_view_count": view_count, "like_count": like_count,
-            "upload_date_iso": upload_date_iso, "comments_count": comments_count,
-            "channel_id": channel_id, "channel_name": channel_name,
-            "channel_username": channel_username, "subscriber_count": subscriber_count,
+            "video_id": video_id,
+            "title": title,
+            "description": description,
+            "video_view_count": view_count,
+            "upload_date_iso": upload_date_iso,
+            "duration_seconds": duration_seconds,
+            "duration_text": seconds_to_hms(duration_seconds),
+            "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            "like_count": like_count,
+            "comments_count": comments_count,
+            "comments_off": False,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "channel_username": channel_username,
+            "subscriber_count": subscriber_count,
             "channel_url": channel_url,
-            "video_url": url, "hashtags": hashtags, "content_type": "short", "data_source": "playwright_shorts"
+            "video_url": url,
+            "hashtags": hashtags,
+            "content_type": "short",
+            "data_source": "playwright_shorts"
         }
     except Exception as e:
         logging.error("Shorts extractor failed: %s", e, exc_info=True)
