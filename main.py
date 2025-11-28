@@ -600,6 +600,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             overlay = find_nested_key(initial, "reelPlayerOverlayRenderer") or find_nested_key(initial, "shortsPlayerOverlayRenderer")
         title = None; view_count = None; like_count = None; channel_name = None; channel_id = None; description = None
         channel_username = None; subscriber_count = None; upload_date_iso = None; comments_count = None
+        duration_seconds = None
         
         # Try to get data from player_json.videoDetails first (most reliable)
         if player_json and isinstance(player_json, dict):
@@ -610,11 +611,27 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 view_count = view_count or (int(vd.get("viewCount")) if vd.get("viewCount") and str(vd.get("viewCount")).isdigit() else parse_count_text_to_int(vd.get("viewCount")))
                 channel_name = channel_name or vd.get("author")
                 channel_id = channel_id or vd.get("channelId")
+                # Extract duration
+                try:
+                    duration_seconds = duration_seconds or (int(vd.get("lengthSeconds")) if vd.get("lengthSeconds") else None)
+                except Exception:
+                    pass
             
             # Extract date from microformat (multiple sources)
             microformat = player_json.get("microformat", {}).get("playerMicroformatRenderer", {}) or {}
             if microformat:
                 upload_date_iso = upload_date_iso or microformat.get("publishDate") or microformat.get("uploadDate")
+                channel_name = channel_name or microformat.get("ownerChannelName")
+                # Try to get external channel ID
+                external_channel_id = microformat.get("externalChannelId")
+                if external_channel_id:
+                    channel_id = channel_id or external_channel_id
+                # Get channel URL and extract username
+                owner_profile_url = microformat.get("ownerProfileUrl")
+                if owner_profile_url and '/@' in owner_profile_url:
+                    match = re.search(r'/@([A-Za-z0-9_.-]+)', owner_profile_url)
+                    if match:
+                        channel_username = channel_username or match.group(1)
         
         if overlay:
             title = title or _text_from(overlay.get("reelTitleText") or overlay.get("shortsTitleText"))
@@ -625,18 +642,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_id = channel_id or ch.get("browseEndpoint", {}).get("browseId")
             channel_name = channel_name or _text_from(find_nested_key(overlay, "channelTitleText"))
         
-        # Try structured data (ld+json) for title - iterate ALL script tags to find video data
-        if not title:
-            try:
-                title = page.evaluate("""() => {
-                    // Try structured data - iterate ALL ld+json scripts to find video data
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
-                        try {
-                            const data = JSON.parse(ldJson.textContent);
-                            // Check for name field (VideoObject will have this)
-                            if (data.name) return data.name;
-        # Fix 1: Improved structured data extraction - handle both single object and array formats
+        # Improved structured data extraction - handle both single object and array formats
         if not title or not upload_date_iso or not channel_name:
             try:
                 ld_data = page.evaluate("""() => {
@@ -798,7 +804,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_info = page.evaluate("""() => {
                     // Look specifically in the shorts player overlay for channel info
                     // The channel link should be in the video owner section, not in the sidebar
-                    const ownerLinks = document.querySelectorAll('ytd-channel-name a, .ytd-reel-player-overlay-renderer a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/channel/"]');
+                    const ownerLinks = document.querySelectorAll('ytd-channel-name a, .ytd-reel-player-overlay-renderer a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/channel/"], ytd-reel-video-renderer a[href*="/@"], #channel-name a');
                     for (const link of ownerLinks) {
                         const text = (link.innerText || link.textContent || '').trim();
                         // Skip if it's "Shopping" or empty
@@ -806,9 +812,6 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                             return {name: text, href: link.href};
                         }
                     }
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
@@ -854,14 +857,11 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             try:
                 channel_username = page.evaluate("""() => {
                     // Look for channel link with /@username pattern - be specific
-                    const handleLinks = document.querySelectorAll('ytd-channel-name a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/@"]');
+                    const handleLinks = document.querySelectorAll('ytd-channel-name a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/@"], ytd-reel-video-renderer a[href*="/@"], #channel-name a[href*="/@"]');
                     for (const link of handleLinks) {
                         const match = link.href.match(/@([A-Za-z0-9_.-]+)/);
                         if (match) return match[1];
                     }
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
@@ -884,9 +884,28 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         # Extract subscriber_count from DOM
         try:
             sub_text = page.evaluate("""() => {
-                // Try subscriber count in shorts overlay
-                const subCount = document.querySelector('ytd-reel-video-renderer #subscriber-count, #owner-sub-count, .ytd-reel-player-overlay-renderer #subscriber-count');
-                if (subCount) return subCount.innerText || subCount.textContent;
+                // Try subscriber count in shorts overlay - multiple selectors
+                const selectors = [
+                    'ytd-reel-video-renderer #subscriber-count',
+                    '#owner-sub-count',
+                    '.ytd-reel-player-overlay-renderer #subscriber-count',
+                    'ytd-channel-name + #subscriber-count',
+                    '#channel-container #subscriber-count',
+                    'yt-formatted-string#subscriber-count'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        if (text && /\\d/.test(text)) return text;
+                    }
+                }
+                // Try aria-label on subscriber count elements
+                const ariaElements = document.querySelectorAll('[aria-label*="subscriber"]');
+                for (const el of ariaElements) {
+                    const label = el.getAttribute('aria-label') || '';
+                    if (/\\d/.test(label)) return label;
+                }
                 return null;
             }""")
             subscriber_count = parse_count_text_to_int(sub_text)
@@ -922,9 +941,6 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if not description:
             try:
                 description = page.evaluate("""() => {
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data first - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
@@ -1060,6 +1076,36 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             except Exception:
                 pass
         
+        # Extract duration from DOM if still missing
+        if not duration_seconds:
+            try:
+                duration_text_dom = page.evaluate("""() => {
+                    // Try duration from structured data
+                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    for (const ldJson of ldJsonScripts) {
+                        try {
+                            const data = JSON.parse(ldJson.textContent);
+                            if (data.duration) return data.duration;
+                        } catch(e) {}
+                    }
+                    // Try video player duration display
+                    const badge = document.querySelector('.ytp-time-duration');
+                    if (badge) return badge.innerText || badge.textContent;
+                    return null;
+                }""")
+                if duration_text_dom:
+                    # Parse duration text like "10:30" or "1:02:45" or ISO 8601 like "PT10M30S"
+                    if duration_text_dom.startswith('PT'):
+                        duration_seconds = parse_iso8601_duration(duration_text_dom)
+                    else:
+                        parts = duration_text_dom.split(':')
+                        if len(parts) == 2:
+                            duration_seconds = int(parts[0]) * 60 + int(parts[1])
+                        elif len(parts) == 3:
+                            duration_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            except Exception:
+                pass
+        
         # Build channel_url - prefer channel_username handle, then channel_id
         if channel_username:
             channel_url = f"https://www.youtube.com/@{channel_username}"
@@ -1070,15 +1116,26 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         
         hashtags = extract_hashtags_from_text(description)
         return {
-            "video_id": video_id, "title": title, "description": description,
-            "video_view_count": view_count, "upload_date_iso": upload_date_iso, "like_count": like_count,
-            "comments_count": comments_count, "channel_id": channel_id, "channel_name": channel_name,
-            "video_view_count": view_count, "like_count": like_count,
-            "upload_date_iso": upload_date_iso, "comments_count": comments_count,
-            "channel_id": channel_id, "channel_name": channel_name,
-            "channel_username": channel_username, "subscriber_count": subscriber_count,
+            "video_id": video_id,
+            "title": title,
+            "description": description,
+            "video_view_count": view_count,
+            "upload_date_iso": upload_date_iso,
+            "duration_seconds": duration_seconds,
+            "duration_text": seconds_to_hms(duration_seconds),
+            "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            "like_count": like_count,
+            "comments_count": comments_count,
+            "comments_off": False,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "channel_username": channel_username,
+            "subscriber_count": subscriber_count,
             "channel_url": channel_url,
-            "video_url": url, "hashtags": hashtags, "content_type": "short", "data_source": "playwright_shorts"
+            "video_url": url,
+            "hashtags": hashtags,
+            "content_type": "short",
+            "data_source": "playwright_shorts"
         }
     except Exception as e:
         logging.error("Shorts extractor failed: %s", e, exc_info=True)
@@ -1618,106 +1675,12 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
     logging.info("  Channel scrape types=%s, videos_cap=%d, shorts_cap=%d, overall_cap=%d", types, videos_cap, shorts_cap, overall_cap)
     
     links_seen: Set[str] = set()
-    video_urls: List[str] = []  # regular videos (watch?v=)
-    shorts_urls: List[str] = []  # shorts (/shorts/)
-    
-    def collect_urls_from_page(target_cap: int, url_type: str) -> List[str]:
-        """Scroll and collect URLs from current page, filtering by type."""
-        collected: List[str] = []
-        rounds = 0
-        max_rounds = 60
-        
-        while len(collected) < target_cap and rounds < max_rounds and not STOP_FLAG:
-            try:
-                hrefs = page.evaluate("""
-                    () => {
-                        const out = new Set();
-                        const sel = [
-                            'a#video-title',
-                            'a#video-title-link',
-                            'a[href*="/watch?v="]',
-                            'a[href*="/shorts/"]',
-                            'ytd-reel-item-renderer a[href*="/shorts/"]',
-                            'ytd-reel-shelf-renderer a[href*="/shorts/"]'
-                        ];
-                        sel.forEach(s => {
-                            document.querySelectorAll(s).forEach(a => {
-                                try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                            });
-                        });
-                        // fallback: look for any href attributes that include /shorts/ or watch?v=
-                        document.querySelectorAll('[href*="/shorts/"], a[href*="/watch?v="]').forEach(a => {
-                            try { if (a.href) out.add(a.href.split('#')[0]); } catch(e){}
-                        });
-                        return Array.from(out);
-                    }
-                """) or []
-            except Exception:
-                hrefs = []
-
-            for h in hrefs:
-                if STOP_FLAG or len(collected) >= target_cap:
-                    break
-                try:
-                    full = h if h.startswith("http") else f"https://www.youtube.com{h}"
-                    full = clean_video_url(full)
-                    vid = extract_video_id(full)
-                    if not vid:
-                        continue
-                    if full in links_seen:
-                        continue
-                    
-                    # Filter by URL type
-                    is_short = "/shorts/" in full
-                    if url_type == "shorts" and not is_short:
-                        continue
-                    if url_type == "video" and is_short:
-                        continue
-                    
-                    links_seen.add(full)
-                    collected.append(full)
-                except Exception:
-                    continue
-
-            if len(collected) >= target_cap:
-                break
-            page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(350)
-            rounds += 1
-        
-        return collected
+    all_video_urls: List[str] = []
     
     def try_navigate_to_tab(url: str) -> bool:
         """Try to navigate to a channel tab and return success."""
-    Fix 2: Restructured to navigate to BOTH /videos and /shorts tabs when both types are requested,
-    then combine results up to the caps.
-    """
-    global STOP_FLAG
-
-    base = channel_url.split('?')[0].rstrip("/")
-    videos_url = base + "/videos"
-    shorts_url = base + "/shorts"
-    
-    types = normalize_search_video_types(input_options)
-    logging.info("  Channel scraping for types: %s", types)
-    
-    # Get per-type caps
-    default_cap = int(input_options.get("maxResults", 10))
-    video_cap = get_cap_for_type("video", input_options, default_cap) if "video" in types else 0
-    shorts_cap = get_cap_for_type("shorts", input_options, default_cap) if "shorts" in types else 0
-    
-    all_video_urls: List[str] = []
-    links_seen: Set[str] = set()
-    
-    def collect_urls_from_page(target_url: str, url_pattern: str, cap: int) -> List[str]:
-        """Helper to collect URLs from a channel tab page."""
-        nonlocal links_seen
-        if cap <= 0:
-            return []
-        
-        collected: List[str] = []
         try:
-            goto_and_ready(page, target_url)
+            goto_and_ready(page, url)
             if is_page_unavailable(page):
                 logging.info("  Candidate %s reports unavailable", url)
                 return False
@@ -1734,17 +1697,16 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
             logging.warning("  Failed to open %s: %s", url, e)
             return False
 
-    # When both types are requested, collect from BOTH tabs separately
-    if want_videos and videos_cap > 0:
-        logging.info("  Collecting regular videos from /videos tab (cap=%d)...", videos_cap)
-        if try_navigate_to_tab(videos_candidate):
-            video_urls = collect_urls_from_page(videos_cap, "video")
-            logging.info("  Collected %d regular video URLs from /videos tab", len(video_urls))
-        else:
-            # Fallback: try original channel URL for videos
-            if try_navigate_to_tab(channel_url):
-                video_urls = collect_urls_from_page(videos_cap, "video")
-                logging.info("  Collected %d regular video URLs from channel home", len(video_urls))
+    def collect_urls_from_page(target_url: str, url_pattern: str, cap: int) -> List[str]:
+        """Navigate to target_url and collect URLs matching url_pattern up to cap."""
+        nonlocal links_seen
+        if cap <= 0:
+            return []
+        
+        collected: List[str] = []
+        try:
+            goto_and_ready(page, target_url)
+            if is_page_unavailable(page):
                 logging.info("  Tab %s reports unavailable", target_url)
                 return []
             
@@ -1813,18 +1775,18 @@ def scrape_channel_all_videos(page: Page, context: BrowserContext, channel_url: 
         except Exception as e:
             logging.warning("  Failed to collect from %s: %s", target_url, e)
             return collected
-    
-    # Fix 2: Collect regular videos if requested
-    if "video" in types and video_cap > 0 and not STOP_FLAG:
-        logging.info("  Collecting up to %d regular videos from %s", video_cap, videos_url)
-        video_urls = collect_urls_from_page(videos_url, "/watch", video_cap)
+
+    # Collect regular videos if requested
+    if "video" in types and videos_cap > 0 and not STOP_FLAG:
+        logging.info("  Collecting up to %d regular videos from %s", videos_cap, videos_candidate)
+        video_urls = collect_urls_from_page(videos_candidate, "/watch", videos_cap)
         all_video_urls.extend(video_urls)
         logging.info("  Collected %d regular video URLs", len(video_urls))
     
-    # Fix 2: Collect shorts if requested
+    # Collect shorts if requested
     if "shorts" in types and shorts_cap > 0 and not STOP_FLAG:
-        logging.info("  Collecting up to %d shorts from %s", shorts_cap, shorts_url)
-        shorts_urls = collect_urls_from_page(shorts_url, "/shorts/", shorts_cap)
+        logging.info("  Collecting up to %d shorts from %s", shorts_cap, shorts_candidate)
+        shorts_urls = collect_urls_from_page(shorts_candidate, "/shorts/", shorts_cap)
         all_video_urls.extend(shorts_urls)
         logging.info("  Collected %d shorts URLs", len(shorts_urls))
     
