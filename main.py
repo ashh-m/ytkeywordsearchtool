@@ -621,6 +621,17 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             microformat = player_json.get("microformat", {}).get("playerMicroformatRenderer", {}) or {}
             if microformat:
                 upload_date_iso = upload_date_iso or microformat.get("publishDate") or microformat.get("uploadDate")
+                channel_name = channel_name or microformat.get("ownerChannelName")
+                # Try to get external channel ID
+                external_channel_id = microformat.get("externalChannelId")
+                if external_channel_id:
+                    channel_id = channel_id or external_channel_id
+                # Get channel URL and extract username
+                owner_profile_url = microformat.get("ownerProfileUrl")
+                if owner_profile_url and '/@' in owner_profile_url:
+                    match = re.search(r'/@([A-Za-z0-9_.-]+)', owner_profile_url)
+                    if match:
+                        channel_username = channel_username or match.group(1)
         
         if overlay:
             title = title or _text_from(overlay.get("reelTitleText") or overlay.get("shortsTitleText"))
@@ -793,7 +804,7 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                 channel_info = page.evaluate("""() => {
                     // Look specifically in the shorts player overlay for channel info
                     // The channel link should be in the video owner section, not in the sidebar
-                    const ownerLinks = document.querySelectorAll('ytd-channel-name a, .ytd-reel-player-overlay-renderer a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/channel/"]');
+                    const ownerLinks = document.querySelectorAll('ytd-channel-name a, .ytd-reel-player-overlay-renderer a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/channel/"], ytd-reel-video-renderer a[href*="/@"], #channel-name a');
                     for (const link of ownerLinks) {
                         const text = (link.innerText || link.textContent || '').trim();
                         // Skip if it's "Shopping" or empty
@@ -801,9 +812,6 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
                             return {name: text, href: link.href};
                         }
                     }
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
@@ -849,14 +857,11 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
             try:
                 channel_username = page.evaluate("""() => {
                     // Look for channel link with /@username pattern - be specific
-                    const handleLinks = document.querySelectorAll('ytd-channel-name a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/@"]');
+                    const handleLinks = document.querySelectorAll('ytd-channel-name a[href*="/@"], .ytd-reel-player-overlay-renderer a[href*="/@"], ytd-reel-video-renderer a[href*="/@"], #channel-name a[href*="/@"]');
                     for (const link of handleLinks) {
                         const match = link.href.match(/@([A-Za-z0-9_.-]+)/);
                         if (match) return match[1];
                     }
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
@@ -879,9 +884,28 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         # Extract subscriber_count from DOM
         try:
             sub_text = page.evaluate("""() => {
-                // Try subscriber count in shorts overlay
-                const subCount = document.querySelector('ytd-reel-video-renderer #subscriber-count, #owner-sub-count, .ytd-reel-player-overlay-renderer #subscriber-count');
-                if (subCount) return subCount.innerText || subCount.textContent;
+                // Try subscriber count in shorts overlay - multiple selectors
+                const selectors = [
+                    'ytd-reel-video-renderer #subscriber-count',
+                    '#owner-sub-count',
+                    '.ytd-reel-player-overlay-renderer #subscriber-count',
+                    'ytd-channel-name + #subscriber-count',
+                    '#channel-container #subscriber-count',
+                    'yt-formatted-string#subscriber-count'
+                ];
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        if (text && /\\d/.test(text)) return text;
+                    }
+                }
+                // Try aria-label on subscriber count elements
+                const ariaElements = document.querySelectorAll('[aria-label*="subscriber"]');
+                for (const el of ariaElements) {
+                    const label = el.getAttribute('aria-label') || '';
+                    if (/\\d/.test(label)) return label;
+                }
                 return null;
             }""")
             subscriber_count = parse_count_text_to_int(sub_text)
@@ -917,9 +941,6 @@ def extract_shorts_metadata(video_id: str, url: str, page: Page) -> Dict[str, An
         if not description:
             try:
                 description = page.evaluate("""() => {
-                    // Try structured data - iterate ALL ld+json scripts
-                    const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-                    for (const ldJson of ldJsonScripts) {
                     // Try structured data first - handle array format
                     const ldJsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
                     for (const script of ldJsonScripts) {
